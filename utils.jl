@@ -1,6 +1,38 @@
 
 using StatsBase
 using InlineStrings
+using SparseArrays
+
+## shuffle a boolean sparsematrix, columnwise
+function colshuffle(x::SparseMatrixCSC{Bool, Int64})
+    idxs = axes(x,1)
+    r = Int64[]
+    c = Int64[]
+    for i in axes(x,2)
+        n = nnz(view(x,:,i))
+        k = sample(idxs, n, replace=false)
+        append!(r,k)
+        append!(c,fill(i,n))
+    end
+    return sparse(r,c,trues(nnz(x)),size(x,1),size(x,2))
+end
+
+## random boolean sparsematrix
+function randnet(NV, mu, sd)::SparseMatrixCSC{Bool, Int64}
+    idxs = 1:NV
+    r = Int64[]
+    c = Int64[]
+    tot = 0
+    for i in 1:NV
+        n = round(Int64, mu + sd*randn())
+        k = sample(idxs, n, replace=false)
+        append!(r,k)
+        append!(c,fill(i,n))
+        tot += n
+    end
+    return sparse(r,c,trues(tot),NV,NV)
+end
+
 
 ## convert to integer, missing becomes 0
 int(x::T) where T<:Real = round(Int64, x)

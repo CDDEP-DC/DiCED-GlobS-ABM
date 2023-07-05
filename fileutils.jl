@@ -12,6 +12,7 @@ function tryJSON(f::AbstractString)::Dict{String,Any}
 end
 
 function dser_path(f::AbstractString)
+    println("reading ", f)
     return deserialize(abspath(f))
 end
 
