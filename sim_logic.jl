@@ -236,7 +236,13 @@ function modelInputs(unit_ids::Vector{Int64}; kwargs...)
     ## assigning agents to sim units
     ## TODO: optimize
     n = length(unit_ids)
-    assign_idxs = Dict(unit_ids .=> ranges(lrRound(fill(size(netw_hh,2)/n, n))))
+    nn = size(netw_hh,2)
+    #assign_idxs = Dict(unit_ids .=> ranges(lrRound(fill(nn/n, n))))
+    ## not really necessary to randomize but doesn't hurt
+    splits = ranges(lrRound(fill(nn/n, n)))
+    idxs = shuffle(1:nn)
+    assign_idxs = Dict(unit_ids .=> [idxs[i] for i in splits])
+
     assign_dummies = Dict(i => collect(intersect(dummies, assign_idxs[i])) for i in unit_ids)
     assign_outw = Dict(i => collect(intersect(outw, assign_idxs[i])) for i in unit_ids)
 
@@ -262,7 +268,9 @@ end
 function globalData(inputs::modelInputs)
     g = zeros(UInt8,size(inputs.netw,2));
     for (k,r) in inputs.agents_assigned
-        g[r] .= k
+        for i in collect(r)
+            g[i] = k
+        end
     end
     return globalData(g)
 end
@@ -278,7 +286,7 @@ function init_sim_unit!(u::SimUnit, id::Int64, inputs::modelInputs)
     ## add state variables and parameters
     u[:netw] = spzeros(Bool,size(inputs.netw)) ## zeros use no memory in a sparse array
     u[:netw][:,inputs.agents_assigned[id]] = copy(inputs.netw[:,inputs.agents_assigned[id]]) ## copy just the columns assigned to this unit
-    u[:agents_assigned] = inputs.agents_assigned[id]
+    u[:agents_assigned] = Set(inputs.agents_assigned[id]) ## must be a Set or a UnitRange
     u[:n_agents] = length(u[:agents_assigned])
     u[:dummies_assigned] = inputs.dummies_assigned[id]
     u[:outw_assigned] = inputs.outw_assigned[id]
@@ -303,7 +311,7 @@ function init_sim_unit!(u::SimUnit, id::Int64, inputs::modelInputs)
         end
     end
     q_event!(u, periodicStuff(u[:periodic_stuff_period]))
-    q_event!(u, reportingEvent(u[:report_freq]))
+    q_event!(u, reportingEvent(1))
 
     return nothing
 end
