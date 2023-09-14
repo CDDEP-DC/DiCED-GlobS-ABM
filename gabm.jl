@@ -47,7 +47,7 @@ function handle_event!(local_sim::SimUnit, e::syncEvent)::Vector{simEvent}
     empty!(local_sim[:global_events]) 
     ##await incoming global events
     events::Vector{simEvent} = take!(inchan)
-    #println("took ", length(events), " events from inchan")
+    println("t = ", timeof(e), "; q len = ", length(local_sim[:q]), "; took ", length(events), " events from global")
     ##queue the next sync
     q_event!(local_sim, syncEvent(timeof(e) + local_sim[:t_inc]))
     ## distributed garbage collection is not very smart
@@ -169,7 +169,7 @@ function run(tStop::Int, unit_ids::Vector{Int64}; kwargs...)
     ## create sim units and start remote processes
     glob_data = spawn_units!(tStop, unit_ids, futures, in_chans, out_chans, report_chans; kwargs...)
     GC.gc()
-    
+        
     ## handle global sync
     glob_dicts = Vector{Dict{Int64,Vector{simEvent}}}(undef,length(unit_ids))
     global_events = Dict{Int64,Vector{simEvent}}()
@@ -186,7 +186,7 @@ function run(tStop::Int, unit_ids::Vector{Int64}; kwargs...)
 
         ## send to designated workers (no need to do this async)
         for (k::Int64, v::Vector{simEvent}) in global_events
-            println("putting ", length(v), " events on inchan ", k)
+            #println("putting ", length(v), " events on inchan ", k)
             try
                 ## if channel is local, probably need to make a copy
                 ## or maybe not, because we're not doing anything to "v" but only to the Dict its reference lives in?
@@ -194,7 +194,7 @@ function run(tStop::Int, unit_ids::Vector{Int64}; kwargs...)
                 ## if channel is on remote worker, data is copied automatically:
                 put!(in_chans[k], v)
             catch e
-                println("channel ", k, " was closed")
+                println("channel ", k, " prematurely closed")
             end
         end
         ## using mergewith!(), so empty for next loop:

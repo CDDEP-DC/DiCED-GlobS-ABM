@@ -3,10 +3,19 @@ include("utils.jl")
 include("fileutils.jl")
 
 ## remote workers need these definitions
+##
+## NOTE : remote workers currently don't have utils.jl (to save memory)
+##
 @everywhere begin
 
 using Random
 using SparseArrays
+
+## samples with replacement from collection a
+## if a is empty, returns an empty vector instead of an error
+function rsamp(a::AbstractArray{T}, n::I)::Vector{T} where {T<:Any,I<:Integer}
+    return isempty(a) ? T[] : rand(a,n)
+end
 
 ##
 ## can create any type of event, just need to write a handler for it like event handlers below
@@ -56,8 +65,43 @@ function handle_event!(local_sim::SimUnit, e::infectionEvent)::Vector{simEvent}
     return [becomeContagious(e.t + local_sim[:t_inc], e.agentid)]
 end
 
+## no longer doing it this way
+## Bernouilli sampling, everyone in "neigh" has probability p of becoming infected
+#function infect_Bern(neigh::Vector{UInt32}, p::Float64)::Vector{UInt32}
+#    return randsubseq(neigh, p) ## fn provided by Random, promises efficient Bernouilli sampling
+#end
+## people encounter some contacts often, others not at all
+## overall transmission prob same as bern, but small # of transmissions more likely
+#function infect_clumped(neigh::Vector{UInt32}, p::Float64)::Vector{UInt32}
+#    return unique(randsubseq(rand(neigh,length(neigh)), p)) ## rand() samples with replacement
+#end
+
+##
+## functions used in becomeContagious handler to specify the distribution of secondary infections
+##
+
+## all neighbors are contacted once or with equal frequency/intensity
+##   note, params must be an empty tuple () if using this fn
+function distr_all(neigh::AbstractVector{I}, params::Tuple{})::Vector{UInt32} where I<:Integer
+    return neigh
+end
+
+## N random contact events; samples with replacement; N is the first/only value in params
+##   note, params must be a single-Int tuple (N,) if using this fn 
+function distr_const(neigh::AbstractVector{I}, params::Tuple{Int64})::Vector{UInt32} where I<:Integer
+    return rsamp(neigh, params[1])
+end
+
+## fn to indicate no contacts of a certain type
+function distr_zero(neigh::AbstractVector{I}, params::Tuple{})::Vector{UInt32} where I<:Integer
+    return UInt32[]
+end
+
+##
+## the becomeContagious handler
+##   if agent is susceptible, change state, and generate all future infection events that result
+##
 function handle_event!(u::SimUnit, e::becomeContagious)::Vector{simEvent}
-    ## if agent is susceptible, change state, and generate all future infection events that result
     i = e.agentid
     if in(i, u[:I_set]) || in(i, u[:R_set]) ## testing set membership is O(1)
         return simEvent[] ## agent not susceptible
@@ -66,16 +110,48 @@ function handle_event!(u::SimUnit, e::becomeContagious)::Vector{simEvent}
         push!(u[:I_set], i) ## append to current infected set
         duration = rand(u[:t_recovery])
         recov_event = becomeRecovered(e.t + duration, i)
-        neigh = findall(u[:netw][:,i]) ## note, this is not really a "find", it's just a lookup in a sparse array
-        if isempty(neigh)
-            return [recov_event] ## no neighbors
+
+        neigh_non_hh::Vector{UInt32} = findall(u[:netw_non_hh][:,i]) ## note, this is not really a "find", it's just a lookup in a sparse array
+        neigh_hh::Vector{UInt32} = findall(u[:netw_hh][:,i]) 
+
+        ## possible ephemeral/location-based contacts
+        if haskey(u[:loc_lookup_res], i)
+            res_loc::UInt32 = u[:loc_lookup_res][i]
+            neigh_loc_res::Vector{UInt32} = findall(u[:loc_matrix_res][:,res_loc]) ## columns of this sparse matrix are locations
         else
-            infected = randsubseq(neigh, u[:p_inf]) ## fn provided by Random, promises efficient Bernouilli sampling
-            infection_events = [infectionEvent(e.t + rand(0:duration), targ) for targ in infected]
-            ## return infection events and recovery event
-            return [infection_events; recov_event]
+            neigh_loc_res = UInt32[]
         end
+        if haskey(u[:loc_lookup_work], i)
+            work_loc::UInt32 = u[:loc_lookup_work][i]
+            neigh_loc_work::Vector{UInt32} = findall(u[:loc_matrix_work][:,work_loc])
+        else
+            neigh_loc_work = UInt32[]
+        end
+
+        contacts_non_hh::Vector{UInt32} = u[:distr_fn_non_hh](neigh_non_hh, u[:distr_params_non_hh])
+        contacts_hh::Vector{UInt32} = u[:distr_fn_hh](neigh_hh, u[:distr_params_hh])
+        contacts_loc_res::Vector{UInt32} = u[:distr_fn_loc_res](neigh_loc_res, u[:distr_params_loc_res])
+        contacts_loc_work::Vector{UInt32} = u[:distr_fn_loc_work](neigh_loc_work, u[:distr_params_loc_work])
+        ## anyone in the population is a potential nonlocal contact
+        contacts_nonloc::Vector{UInt32} = u[:distr_fn_nonloc](axes(u[:netw_non_hh],1), u[:distr_params_nonloc]) 
+        ## randsubseq promises efficient Bernouilli sampling
+        ##   unique() because infecting someone twice doesn't have any additional effect
+        infected::Vector{UInt32} = unique(vcat(
+            randsubseq(contacts_non_hh,u[:p_inf]),
+            randsubseq(contacts_hh,u[:p_inf_hh]),
+            randsubseq(contacts_loc_res,u[:p_inf_loc]),
+            randsubseq(contacts_loc_work,u[:p_inf_loc]),
+            randsubseq(contacts_nonloc,u[:p_inf_loc])))
+
+        infection_events = [infectionEvent(e.t + rand(0:duration), targ) for targ in infected]
+        ##
+        ## TODO: log number of secondary infections
+        ##
+
+        ## return infection events and recovery event
+        return [infection_events; recov_event]
     end
+
 end
 
 function handle_event!(local_sim::SimUnit, e::becomeRecovered)::Vector{simEvent}
@@ -92,6 +168,11 @@ function handle_event!(u::SimUnit, e::periodicStuff)::Vector{simEvent}
     P_infected = length(u[:I_set]) / u[:n_agents]
 
     ## mean number of infected home / work connections
+    
+    ##
+    ## TODO: add mean location-based contacts to this calculation
+    ##
+
     n_home = P_infected * u[:mean_hh_connections]
     n_work = P_infected * u[:mean_wp_connections]
 
@@ -189,13 +270,22 @@ function sort_glob_events(glob_data::globalData, targets::Vector{Int64}, global_
 end
 
 ## data needed to initialize sim units
-##  parametric types T U V etc can be anything the functions below are written to handle
-##  (this didn't really need to be a struct, but it makes the syntax below cleaner)
-@kwdef struct modelInputs{T,U,V,W} <: abstractModelInputs
-    netw::T
+## all external inputs go into this struct, which the global process then uses to initialize local sim units
+##   parametric types T U V etc can be anything the functions below are written to handle
+##   (this didn't really need to be a struct, but it makes the syntax below cleaner)
+@kwdef struct modelInputs{U,V,W,Ta,Tb,Tc,Td,Te} <: abstractModelInputs
+    #netw::SparseMatrixCSC{Bool,UInt32}
+    netw_hh::SparseMatrixCSC{Bool,UInt32}
+    netw_non_hh::SparseMatrixCSC{Bool,UInt32}
+    loc_matrix_res::SparseMatrixCSC{Bool,UInt32}
+    loc_matrix_work::SparseMatrixCSC{Bool,UInt32}
+    loc_lookup_res::Dict{UInt32,UInt32}
+    loc_lookup_work::Dict{UInt32,UInt32}
     agents_assigned::U
     t_inc::Int64
     p_inf::Float64
+    p_inf_hh::Float64
+    p_inf_loc::Float64
     t_recovery::V
     init_inf::Dict{Int64,Int64}
     dummies_assigned::W
@@ -203,32 +293,53 @@ end
     mean_hh_connections::Float64
     mean_wp_connections::Float64
     report_freq::Int64
+    #infection_function::Symbol
+    distr_fn_hh::Symbol
+    distr_params_hh::Ta
+    distr_fn_non_hh::Symbol
+    distr_params_non_hh::Tb
+    distr_fn_loc_res::Symbol
+    distr_params_loc_res::Tc
+    distr_fn_loc_work::Symbol
+    distr_params_loc_work::Td
+    distr_fn_nonloc::Symbol
+    distr_params_nonloc::Te
 end
 
 ## constructor, called in gabm.jl spawn_units!()
 function modelInputs(unit_ids::Vector{Int64}; kwargs...)
 
     ## these funcs only evaluated when needed
-    read_dummies() = Set(keys(dser_path("jlse/adj_dummy_keys.jlse")))
-    read_outw() = Set(keys(dser_path("jlse/adj_out_workers.jlse")))
-    read_hh_net() = sparse(Symmetric(dser_path("jlse/hh_adj_mat.jlse")))
-    read_non_hh() = sparse(Symmetric(dser_path("jlse/adj_mat.jlse")))
+    read_dummies() = Set{UInt32}(keys(dser_path("jlse/adj_dummy_keys.jlse")))
+    read_outw() = Set{UInt32}(keys(dser_path("jlse/adj_out_workers.jlse")))
+    read_netw_hh() = (println("read hh net"); SparseMatrixCSC{Bool,UInt32}(Symmetric(dser_path("jlse/hh_adj_mat.jlse"))) )
+    read_netw_non_hh() = (println("read non-hh net"); SparseMatrixCSC{Bool,UInt32}(Symmetric(dser_path("jlse/adj_mat.jlse"))) )
+    read_loc_matrix_res() = (println("read res loc mat"); SparseMatrixCSC{Bool,UInt32}(dser_path("jlse/res_loc_contact_mat.jlse")) )
+    read_loc_matrix_work() = (println("read work loc mat"); SparseMatrixCSC{Bool,UInt32}(dser_path("jlse/work_loc_contact_mat.jlse")) )
+    read_loc_lookup_res() = Dict{UInt32,UInt32}(dser_path("jlse/res_loc_lookup.jlse"))
+    read_loc_lookup_work() = Dict{UInt32,UInt32}(dser_path("jlse/work_loc_lookup.jlse"))
+
     ## mean household connections, excluding household-less dummies
     calc_mean_hh(netw_hh,dummies) = (println("calc mean hh"); mean(sum(netw_hh[:,setdiff(axes(netw_hh,2), dummies)], dims=1)))
     ## mean workplace connections = mean non-hh cnxs for people with 1+ non-hh cnxs, excluding workplace-less out-workers
     calc_mean_wp(netw_non_hh,outw) = (println("calc mean wp"); mean(filter(x->x>0, sum(netw_non_hh[:,setdiff(axes(netw_non_hh,2), outw)], dims=1))))
     ## for now, just join household and non-hh networks; keyword arg takes precedence if present
-    calc_full_net(netw_hh,netw_non_hh)::SparseMatrixCSC{Bool, Int64} = (println("calc full net"); netw_hh .| netw_non_hh)
+    ## calc_full_net(netw_hh,netw_non_hh)::SparseMatrixCSC{Bool, UInt32} = (println("calc full net"); netw_hh .| netw_non_hh)
 
     ## awkward syntax but avoids costly evaluation when kwargs has the key
-    netw_hh::SparseMatrixCSC{Bool, Int64} = get(read_hh_net, kwargs, :netw_hh)
-    netw_non_hh::SparseMatrixCSC{Bool, Int64} = get(read_non_hh, kwargs, :netw_non_hh)
+    netw_hh::SparseMatrixCSC{Bool, UInt32} = get(read_netw_hh, kwargs, :netw_hh)
+    netw_non_hh::SparseMatrixCSC{Bool, UInt32} = get(read_netw_non_hh, kwargs, :netw_non_hh)
+    loc_matrix_res::SparseMatrixCSC{Bool, UInt32} = get(read_loc_matrix_res, kwargs, :loc_matrix_res)
+    loc_matrix_work::SparseMatrixCSC{Bool, UInt32} = get(read_loc_matrix_work, kwargs, :loc_matrix_work)
+    loc_lookup_res::Dict{UInt32,UInt32} = get(read_loc_lookup_res, kwargs, :loc_lookup_res)
+    loc_lookup_work::Dict{UInt32,UInt32} = get(read_loc_lookup_work, kwargs, :loc_lookup_work)
+
     ## dummies appear in work networks, but live outside the synth pop (no household or demographic info generated)
     ## local sim unit is responsible for determining if they got infected at home
-    dummies::Set{Int64} = get(read_dummies, kwargs, :dummies)
+    dummies::Set{UInt32} = get(read_dummies, kwargs, :dummies)
     ## outside workers have households, but no workplace network
     ## local sim unit is responsible for determining if they got infected at work
-    outw::Set{Int64} = get(read_outw, kwargs, :out_workers)
+    outw::Set{UInt32} = get(read_outw, kwargs, :out_workers)
 
     mu_hh_cnx::Float64 = get(()->calc_mean_hh(netw_hh,dummies), kwargs, :mean_hh_connections)
     mu_work_cnx::Float64 = get(()->calc_mean_wp(netw_non_hh,outw), kwargs, :mean_wp_connections)
@@ -240,7 +351,7 @@ function modelInputs(unit_ids::Vector{Int64}; kwargs...)
     #assign_idxs = Dict(unit_ids .=> ranges(lrRound(fill(nn/n, n))))
     ## not really necessary to randomize but doesn't hurt
     splits = ranges(lrRound(fill(nn/n, n)))
-    idxs = shuffle(1:nn)
+    idxs = UInt32.(shuffle(1:nn))
     assign_idxs = Dict(unit_ids .=> [idxs[i] for i in splits])
 
     assign_dummies = Dict(i => collect(intersect(dummies, assign_idxs[i])) for i in unit_ids)
@@ -249,24 +360,48 @@ function modelInputs(unit_ids::Vector{Int64}; kwargs...)
     println("returning model inputs")
     ## this constructor syntax is enabled by @kwdef macro above
     return modelInputs(
+        netw_hh = netw_hh,
+        netw_non_hh = netw_non_hh,
+        loc_matrix_res = loc_matrix_res,
+        loc_matrix_work = loc_matrix_work,
+        loc_lookup_res = loc_lookup_res,
+        loc_lookup_work = loc_lookup_work,    
+        #netw = get(()->calc_full_net(netw_hh,netw_non_hh), kwargs, :full_net),
         t_inc = get(kwargs, :t_inc, 5),
-        p_inf = get(kwargs, :p_inf, 0.2),
         t_recovery = get(kwargs, :t_recovery, 8:12),
         init_inf = Dict(get(kwargs, :init_inf, [first(unit_ids) => 10])),
-        netw = get(()->calc_full_net(netw_hh,netw_non_hh), kwargs, :full_net),
         agents_assigned = assign_idxs,
         dummies_assigned = assign_dummies,
         outw_assigned = assign_outw,
         mean_hh_connections = mu_hh_cnx,
         mean_wp_connections = mu_work_cnx,
-        report_freq = get(kwargs, :report_freq, 5)
+        report_freq = get(kwargs, :report_freq, 5),
+
+        ## defaults for within-household infection
+        p_inf_hh = get(kwargs, :p_inf_hh, 0.15), 
+        distr_fn_hh = get(kwargs, :distr_fn_hh, :const),
+        distr_params_hh = get(kwargs, :distr_params_hh, (16,)),
+
+        ## defaults for work,school,GQ infection
+        p_inf = get(kwargs, :p_inf, 0.15),
+        distr_fn_non_hh = get(kwargs, :distr_fn_non_hh, :const),
+        distr_params_non_hh = get(kwargs, :distr_params_non_hh, (8,)),
+
+        ## defaults for ephemeral/location-based infection
+        p_inf_loc = get(kwargs, :p_inf_loc, 0.15),
+        distr_fn_loc_res = get(kwargs, :distr_fn_loc_res, :zero),
+        distr_params_loc_res = get(kwargs, :distr_params_loc_res, ()),
+        distr_fn_loc_work = get(kwargs, :distr_fn_loc_work, :zero),
+        distr_params_loc_work = get(kwargs, :distr_params_loc_work, ()),
+        distr_fn_nonloc = get(kwargs, :distr_fn_nonloc, :zero),
+        distr_params_nonloc = get(kwargs, :distr_params_nonloc, ())
         )
 end
 
 ## globalData constructor, called in gabm.jl spawn_units!()
 ## should return whatever sort_glob_events() needs
 function globalData(inputs::modelInputs)
-    g = zeros(UInt8,size(inputs.netw,2));
+    g = zeros(UInt8,size(inputs.netw_hh,2));
     for (k,r) in inputs.agents_assigned
         for i in collect(r)
             g[i] = k
@@ -281,20 +416,30 @@ end
 ## (note, SimUnit type is currently just a Dict with symbol keys, can add any key needed by fns above)
 function init_sim_unit!(u::SimUnit, id::Int64, inputs::modelInputs)
 
-    println("init sim unit ", id)
-
+    print("init sim unit ", id, "; ")
     ## add state variables and parameters
-    u[:netw] = spzeros(Bool,size(inputs.netw)) ## zeros use no memory in a sparse array
-    u[:netw][:,inputs.agents_assigned[id]] = copy(inputs.netw[:,inputs.agents_assigned[id]]) ## copy just the columns assigned to this unit
-    u[:agents_assigned] = Set(inputs.agents_assigned[id]) ## must be a Set or a UnitRange
+    #u[:netw] = spzeros(Bool,UInt32,size(inputs.netw)) ## zeros use no memory in a sparse array
+    #u[:netw][:,inputs.agents_assigned[id]] = copy(inputs.netw[:,inputs.agents_assigned[id]]) ## copy just the columns assigned to this unit
+
+    u[:netw_hh] = spzeros(Bool,UInt32,size(inputs.netw_hh)) ## zeros use no memory in a sparse array
+    u[:netw_non_hh] = spzeros(Bool,UInt32,size(inputs.netw_non_hh)) ## zeros use no memory in a sparse array
+    u[:netw_hh][:,inputs.agents_assigned[id]] = copy(inputs.netw_hh[:,inputs.agents_assigned[id]]) ## copy just the columns assigned to this unit
+    u[:netw_non_hh][:,inputs.agents_assigned[id]] = copy(inputs.netw_non_hh[:,inputs.agents_assigned[id]]) ## copy just the columns assigned to this unit
+    
+    ## every sim unit needs these
+    u[:loc_matrix_res] = inputs.loc_matrix_res
+    u[:loc_matrix_work] = inputs.loc_matrix_work
+    u[:loc_lookup_res] = inputs.loc_lookup_res
+    u[:loc_lookup_work] = inputs.loc_lookup_work
+
+    u[:agents_assigned] = Set{UInt32}(inputs.agents_assigned[id]) ## should be something wih O(1) lookup, like Set or UnitRange
     u[:n_agents] = length(u[:agents_assigned])
-    u[:dummies_assigned] = inputs.dummies_assigned[id]
-    u[:outw_assigned] = inputs.outw_assigned[id]
+    u[:dummies_assigned] = Vector{UInt32}(inputs.dummies_assigned[id]) ## vector because randsubseq can't handle Set
+    u[:outw_assigned] = Vector{UInt32}(inputs.outw_assigned[id]) ## vector because randsubseq can't handle Set
     u[:cum_I] = 0
     u[:I_set] = Set{UInt32}()
     u[:R_set] = Set{UInt32}()
     u[:t_inc] = inputs.t_inc
-    u[:p_inf] = inputs.p_inf
     u[:t_recovery] = inputs.t_recovery
     ## note, these are currently global means (not per sim unit)
     u[:mean_hh_connections] = inputs.mean_hh_connections
@@ -303,6 +448,31 @@ function init_sim_unit!(u::SimUnit, id::Int64, inputs::modelInputs)
     ##  update out-of-network infections on the same timescale so probabilities are correct
     u[:periodic_stuff_period] = round(Int, mean(inputs.t_recovery))
     u[:report_freq] = inputs.report_freq
+
+    u[:p_inf] = inputs.p_inf
+    u[:p_inf_hh] = inputs.p_inf_hh
+    u[:p_inf_loc] = inputs.p_inf_loc
+
+    ## which function to use for infections
+    ## no longer doing it this way
+    #opts = Dict(:bern=>infect_Bern,:clumped=>infect_clumped)
+    #u[:infect_fn] = get(opts, inputs.infection_function, infect_Bern)
+    #println("using infection function ", u[:infect_fn])
+
+    ## which function to use to determine contact events
+    opts = Dict(:all=>distr_all, :const=>distr_const, :zero=>distr_zero)
+    u[:distr_fn_hh] = get(opts, inputs.distr_fn_hh, distr_const)
+    u[:distr_params_hh] = inputs.distr_params_hh
+    u[:distr_fn_non_hh] = get(opts, inputs.distr_fn_non_hh, distr_const)
+    u[:distr_params_non_hh] = inputs.distr_params_non_hh
+    u[:distr_fn_loc_res] = get(opts, inputs.distr_fn_loc_res, distr_zero)
+    u[:distr_params_loc_res] = inputs.distr_params_loc_res
+    u[:distr_fn_loc_work] = get(opts, inputs.distr_fn_loc_work, distr_zero)
+    u[:distr_params_loc_work] = inputs.distr_params_loc_work
+    u[:distr_fn_nonloc] = get(opts, inputs.distr_fn_nonloc, distr_zero)
+    u[:distr_params_nonloc] = inputs.distr_params_nonloc
+    println("using contact functions ", u[:distr_fn_hh], " ", u[:distr_fn_non_hh], " ", u[:distr_fn_loc_res], " ", u[:distr_fn_loc_work], " ", u[:distr_fn_nonloc])
+    println("using contact params ", u[:distr_params_hh], " ", u[:distr_params_non_hh], " ", u[:distr_params_loc_res], " ", u[:distr_params_loc_work], " ", u[:distr_params_nonloc])
 
     ## queue initial events
     if haskey(inputs.init_inf, id)

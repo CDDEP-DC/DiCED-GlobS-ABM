@@ -17,7 +17,7 @@ function colshuffle(x::SparseMatrixCSC{Bool, Int64})
     return sparse(r,c,trues(nnz(x)),size(x,1),size(x,2))
 end
 
-## random boolean sparsematrix
+## random boolean sparsematrix (note, this is not really a network, use Graphs.erdos_renyi for that)
 function randnet(NV, mu, sd)::SparseMatrixCSC{Bool, Int64}
     idxs = 1:NV
     r = Int64[]
