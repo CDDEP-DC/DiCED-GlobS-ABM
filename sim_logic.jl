@@ -10,6 +10,7 @@ include("fileutils.jl")
 
 using Random
 using SparseArrays
+using Distributions
 
 ## samples with replacement from collection a
 ## if a is empty, returns an empty vector instead of an error
@@ -77,23 +78,37 @@ end
 #end
 
 ##
-## functions used in becomeContagious handler to specify the distribution of secondary infections
+## functions used in becomeContagious handler to specify the distribution of contacts
 ##
 
 ## all neighbors are contacted once or with equal frequency/intensity
-##   note, params must be an empty tuple () if using this fn
-function distr_all(neigh::AbstractVector{I}, params::Tuple{})::Vector{UInt32} where I<:Integer
+function distr_all(neigh::AbstractVector{I}, params::T)::Vector{UInt32} where {I<:Integer, T<:Tuple}
     return neigh
 end
 
-## N random contact events; samples with replacement; N is the first/only value in params
+## N random contact events; samples with replacement from neigh; N is the first/only value in params
 ##   note, params must be a single-Int tuple (N,) if using this fn 
 function distr_const(neigh::AbstractVector{I}, params::Tuple{Int64})::Vector{UInt32} where I<:Integer
     return rsamp(neigh, params[1])
 end
 
+## Poission(L) gives the number of contact events, then sample with replacement; L is the first/only value in params
+function distr_pois(neigh::AbstractVector{I}, params::Tuple{Int64})::Vector{UInt32} where I<:Integer
+    n = rand(Poisson(params[1]))
+    return rsamp(neigh, n)
+end
+
+## Geometric (discrete analogue of Exponential) gives the number of contact events; params[1] is the mean
+function safe_rgeo(u::R) where R<:Real
+    return u > 0 ? rand(Geometric(1/(1+u))) : 0 ## must be > 0
+end
+function distr_exp(neigh::AbstractVector{I}, params::Tuple{Int64})::Vector{UInt32} where I<:Integer
+    n = safe_rgeo(params[1])
+    return rsamp(neigh, n)
+end
+
 ## fn to indicate no contacts of a certain type
-function distr_zero(neigh::AbstractVector{I}, params::Tuple{})::Vector{UInt32} where I<:Integer
+function distr_zero(neigh::AbstractVector{I}, params::T)::Vector{UInt32} where {I<:Integer, T<:Tuple}
     return UInt32[]
 end
 
@@ -130,10 +145,32 @@ function handle_event!(u::SimUnit, e::becomeContagious)::Vector{simEvent}
 
         contacts_non_hh::Vector{UInt32} = u[:distr_fn_non_hh](neigh_non_hh, u[:distr_params_non_hh])
         contacts_hh::Vector{UInt32} = u[:distr_fn_hh](neigh_hh, u[:distr_params_hh])
-        contacts_loc_res::Vector{UInt32} = u[:distr_fn_loc_res](neigh_loc_res, u[:distr_params_loc_res])
-        contacts_loc_work::Vector{UInt32} = u[:distr_fn_loc_work](neigh_loc_work, u[:distr_params_loc_work])
+
+        ## if keeping overall contact rate constant, don't allow mean loc contacts to be greater than # neighbors
+        if u[:h_test] && (get(u[:distr_params_loc_res],1,0) > length(neigh_hh))
+            distr_params_loc_res = (length(neigh_hh), u[:distr_params_loc_res][2:end]...)
+        else
+            distr_params_loc_res = u[:distr_params_loc_res]
+        end
+
+        if u[:w_test] && (get(u[:distr_params_loc_work],1,0) > length(neigh_non_hh))
+            distr_params_loc_work = (length(neigh_non_hh), u[:distr_params_loc_work][2:end]...)
+        else
+            distr_params_loc_work = u[:distr_params_loc_work]
+        end
+
+        if u[:h_test] && (get(u[:distr_params_nonloc],1,0) > length(neigh_hh))
+            distr_params_nonloc = (length(neigh_hh), u[:distr_params_nonloc][2:end]...)
+        elseif u[:w_test] && (get(u[:distr_params_nonloc],1,0) > length(neigh_non_hh))
+            distr_params_nonloc = (length(neigh_non_hh), u[:distr_params_nonloc][2:end]...)
+        else
+            distr_params_nonloc = u[:distr_params_nonloc]
+        end
+
+        contacts_loc_res::Vector{UInt32} = u[:distr_fn_loc_res](neigh_loc_res, distr_params_loc_res)
+        contacts_loc_work::Vector{UInt32} = u[:distr_fn_loc_work](neigh_loc_work, distr_params_loc_work)
         ## anyone in the population is a potential nonlocal contact
-        contacts_nonloc::Vector{UInt32} = u[:distr_fn_nonloc](axes(u[:netw_non_hh],1), u[:distr_params_nonloc]) 
+        contacts_nonloc::Vector{UInt32} = u[:distr_fn_nonloc](axes(u[:netw_non_hh],1), distr_params_nonloc) 
         ## randsubseq promises efficient Bernouilli sampling
         ##   unique() because infecting someone twice doesn't have any additional effect
         infected::Vector{UInt32} = unique(vcat(
@@ -165,6 +202,9 @@ end
 function handle_event!(u::SimUnit, e::periodicStuff)::Vector{simEvent}
 
     ## proportion infected in unit's pop
+    ##
+    ## TODO: this doesn't actually estimate the proportion of the population infected, does that matter?
+    ##
     P_infected = length(u[:I_set]) / u[:n_agents]
 
     ## mean number of infected home / work connections
@@ -197,9 +237,8 @@ end
 ## reporting
 function handle_event!(u::SimUnit, e::reportingEvent)::Vector{simEvent}
 
-    ## append proportion infected to log
-    P_infected = length(u[:I_set]) / u[:n_agents]
-    push!(u[:log], (e.t,P_infected))
+    ## append number infected to log
+    push!(u[:log], (e.t, length(u[:I_set])))
 
     ## queue for next period
     q_event!(u, reportingEvent(e.t + u[:report_freq]))
@@ -304,6 +343,7 @@ end
     distr_params_loc_work::Td
     distr_fn_nonloc::Symbol
     distr_params_nonloc::Te
+    flags::Set{Symbol}
 end
 
 ## constructor, called in gabm.jl spawn_units!()
@@ -345,14 +385,20 @@ function modelInputs(unit_ids::Vector{Int64}; kwargs...)
     mu_work_cnx::Float64 = get(()->calc_mean_wp(netw_non_hh,outw), kwargs, :mean_wp_connections)
 
     ## assigning agents to sim units
-    ## TODO: optimize
-    n = length(unit_ids)
-    nn = size(netw_hh,2)
-    #assign_idxs = Dict(unit_ids .=> ranges(lrRound(fill(nn/n, n))))
-    ## not really necessary to randomize but doesn't hurt
-    splits = ranges(lrRound(fill(nn/n, n)))
-    idxs = UInt32.(shuffle(1:nn))
-    assign_idxs = Dict(unit_ids .=> [idxs[i] for i in splits])
+    if haskey(kwargs, :agents_assigned)
+        println("assignment ", [(k,length(v)) for (k,v) in kwargs[:agents_assigned]])
+        assign_idxs = kwargs[:agents_assigned]
+    else
+        println("random assignment")
+        ## TODO: optimize
+        n = length(unit_ids)
+        nn = size(netw_hh,2)
+        #assign_idxs = Dict(unit_ids .=> ranges(lrRound(fill(nn/n, n))))
+        ## not really necessary to randomize but doesn't hurt
+        splits = ranges(lrRound(fill(nn/n, n)))
+        idxs = UInt32.(shuffle(1:nn))
+        assign_idxs = Dict(unit_ids .=> [idxs[i] for i in splits])
+    end
 
     assign_dummies = Dict(i => collect(intersect(dummies, assign_idxs[i])) for i in unit_ids)
     assign_outw = Dict(i => collect(intersect(outw, assign_idxs[i])) for i in unit_ids)
@@ -394,7 +440,10 @@ function modelInputs(unit_ids::Vector{Int64}; kwargs...)
         distr_fn_loc_work = get(kwargs, :distr_fn_loc_work, :zero),
         distr_params_loc_work = get(kwargs, :distr_params_loc_work, ()),
         distr_fn_nonloc = get(kwargs, :distr_fn_nonloc, :zero),
-        distr_params_nonloc = get(kwargs, :distr_params_nonloc, ())
+        distr_params_nonloc = get(kwargs, :distr_params_nonloc, ()),
+
+        ## misc flags
+        flags = Set(get(kwargs, :flags, Symbol[]))
         )
 end
 
@@ -460,7 +509,7 @@ function init_sim_unit!(u::SimUnit, id::Int64, inputs::modelInputs)
     #println("using infection function ", u[:infect_fn])
 
     ## which function to use to determine contact events
-    opts = Dict(:all=>distr_all, :const=>distr_const, :zero=>distr_zero)
+    opts = Dict(:all=>distr_all, :const=>distr_const, :zero=>distr_zero, :pois=>distr_pois, :exp=>distr_exp)
     u[:distr_fn_hh] = get(opts, inputs.distr_fn_hh, distr_const)
     u[:distr_params_hh] = inputs.distr_params_hh
     u[:distr_fn_non_hh] = get(opts, inputs.distr_fn_non_hh, distr_const)
@@ -471,8 +520,12 @@ function init_sim_unit!(u::SimUnit, id::Int64, inputs::modelInputs)
     u[:distr_params_loc_work] = inputs.distr_params_loc_work
     u[:distr_fn_nonloc] = get(opts, inputs.distr_fn_nonloc, distr_zero)
     u[:distr_params_nonloc] = inputs.distr_params_nonloc
+
     println("using contact functions ", u[:distr_fn_hh], " ", u[:distr_fn_non_hh], " ", u[:distr_fn_loc_res], " ", u[:distr_fn_loc_work], " ", u[:distr_fn_nonloc])
-    println("using contact params ", u[:distr_params_hh], " ", u[:distr_params_non_hh], " ", u[:distr_params_loc_res], " ", u[:distr_params_loc_work], " ", u[:distr_params_nonloc])
+    println("using contact params ", u[:distr_params_hh], " ", u[:distr_params_non_hh], " ", u[:distr_params_loc_res], " ", u[:distr_params_loc_work], " ", u[:distr_params_nonloc], " ", inputs.flags)
+
+    u[:h_test] = in(:h_test,inputs.flags)
+    u[:w_test] = in(:w_test,inputs.flags)
 
     ## queue initial events
     if haskey(inputs.init_inf, id)

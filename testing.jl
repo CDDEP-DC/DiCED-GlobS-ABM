@@ -1,11 +1,14 @@
 include("gabm.jl")
 include("sim_logic.jl")
 
+unit_ids = workers()
+n_units = length(unit_ids)
+
 function test(t; kwargs...)
     x = run(t, workers(); kwargs...)
     return Dict(k => (v[:cum_I],v[:curr_I],v[:curr_R],v[:q_len],v[:glob_len]) for (k,v) in x),
             Dict(k => v[:n_agents] for (k,v) in x),
-            Dict(k => v[:log] for (k,v) in x) ## proportion infected is in here
+            Dict(k => v[:log] for (k,v) in x) ## infected data is in here
 end
 
 #adj_mat = sparse(Symmetric(dser_path("jlse/adj_mat.jlse")));
@@ -29,37 +32,81 @@ for i in 2:3
     GC.gc()
 end
 
-for i in 2:3
+for i in 1:3
     serialize("sim_MD_p0"*string(round(Int,pI*100))*"_2_workloc"*string(i)*".jlse", 
         test(t; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI,
+        flags=[:w_test],
         distr_params_hh=(8,), distr_params_non_hh=(6,), distr_fn_loc_work=:const, distr_params_loc_work=(2,)
         ))
     GC.gc()
 end
 
-for i in 2:3
+for i in 1:3
     serialize("sim_MD_p0"*string(round(Int,pI*100))*"_2_resloc"*string(i)*".jlse", 
         test(t; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI,
+        flags=[:h_test],
         distr_params_hh=(6,), distr_fn_loc_res=:const, distr_params_loc_res=(2,)
         ))
     GC.gc()
 end
 
-for i in 2:3
+for i in 1:3
     serialize("sim_MD_p0"*string(round(Int,pI*100))*"_2_res_to_glob"*string(i)*".jlse", 
         test(t; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI,
+        flags=[:h_test],
         distr_params_hh=(6,), distr_fn_nonloc=:const, distr_params_nonloc=(2,)
         ))
     GC.gc()
 end
 
-for i in 2:3
+for i in 1:3
     serialize("sim_MD_p0"*string(round(Int,pI*100))*"_2_work_to_glob"*string(i)*".jlse", 
         test(t; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI,
+        flags=[:w_test],
         distr_params_hh=(8,), distr_params_non_hh=(6,), distr_fn_nonloc=:const, distr_params_nonloc=(2,)
         ))
     GC.gc()
 end
+
+
+
+
+for i in 1:3
+    serialize("sim_MD_p0"*string(round(Int,pI*100))*"_2exp_workloc"*string(i)*".jlse", 
+        test(t; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI,
+        flags=[:w_test],
+        distr_params_hh=(8,), distr_params_non_hh=(6,), distr_fn_loc_work=:exp, distr_params_loc_work=(2,)
+        ))
+    GC.gc()
+end
+
+for i in 1:3
+    serialize("sim_MD_p0"*string(round(Int,pI*100))*"_2exp_resloc"*string(i)*".jlse", 
+        test(t; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI,
+        flags=[:h_test],
+        distr_params_hh=(6,), distr_fn_loc_res=:exp, distr_params_loc_res=(2,)
+        ))
+    GC.gc()
+end
+
+for i in 1:3
+    serialize("sim_MD_p0"*string(round(Int,pI*100))*"_2exp_res_to_glob"*string(i)*".jlse", 
+        test(t; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI,
+        flags=[:h_test],
+        distr_params_hh=(6,), distr_fn_nonloc=:exp, distr_params_nonloc=(2,)
+        ))
+    GC.gc()
+end
+
+for i in 1:3
+    serialize("sim_MD_p0"*string(round(Int,pI*100))*"_2exp_work_to_glob"*string(i)*".jlse", 
+        test(t; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI,
+        flags=[:w_test],
+        distr_params_hh=(8,), distr_params_non_hh=(6,), distr_fn_nonloc=:exp, distr_params_nonloc=(2,)
+        ))
+    GC.gc()
+end
+
 
 
 ## generate random one-time contacts, preserving # contacts per person
@@ -172,23 +219,22 @@ ys_res2 = read_sums("sim_MD_p012_2_resloc",xlim,ids,1:3)
 ys_w2glob = read_sums("sim_MD_p012_2_work_to_glob",xlim,ids,1:3)
 ys_r2glob = read_sums("sim_MD_p012_2_res_to_glob",xlim,ids,1:3)
 
+ys_work2x = read_sums("sim_MD_p012_2exp_workloc",xlim,ids,1:3)
+ys_res2x = read_sums("sim_MD_p012_2exp_resloc",xlim,ids,1:3)
+ys_w2globx = read_sums("sim_MD_p012_2exp_work_to_glob",xlim,ids,1:3)
+ys_r2globx = read_sums("sim_MD_p012_2exp_res_to_glob",xlim,ids,1:3)
+
 plot(xs, hcat(ys_cN,ys_work2),legend=nothing, linecolor=hcat(fill(:black, 1, 3), fill(:red, 1, 3)))
 plot(xs, hcat(ys_cN,ys_res2),legend=nothing, linecolor=hcat(fill(:black, 1, 3), fill(:red, 1, 3)))
 plot(xs, hcat(ys_cN,ys_w2glob),legend=nothing, linecolor=hcat(fill(:black, 1, 3), fill(:red, 1, 3)))
 plot(xs, hcat(ys_cN,ys_r2glob),legend=nothing, linecolor=hcat(fill(:black, 1, 3), fill(:red, 1, 3)))
 
+plot(xs, hcat(ys_cN,ys_work2,ys_work2x),legend=nothing, linecolor=hcat(fill(:black, 1, 3), fill(:red, 1, 3), fill(:blue, 1, 3)))
+plot(xs, hcat(ys_cN,ys_res2,ys_res2x),legend=nothing, linecolor=hcat(fill(:black, 1, 3), fill(:red, 1, 3), fill(:blue, 1, 3)))
+plot(xs, hcat(ys_cN,ys_w2glob,ys_w2globx),legend=nothing, linecolor=hcat(fill(:black, 1, 3), fill(:red, 1, 3), fill(:blue, 1, 3)))
+plot(xs, hcat(ys_cN,ys_r2glob,ys_r2globx),legend=nothing, linecolor=hcat(fill(:black, 1, 3), fill(:red, 1, 3), fill(:blue, 1, 3)))
 
 
-ys_cN_h16 = read_sums("test1_hh_16/sim_MD_p010_constN",xlim,ids,1:3)
-ys_work4 = read_sums("test1_hh_16/sim_MD_p010_4_workloc",xlim,ids,1:3)
-ys_res4 = read_sums("test1_hh_16/sim_MD_p010_4_resloc",xlim,ids,1:1)
-ys_w4glob = read_sums("test1_hh_16/sim_MD_p010_4_work_to_glob",xlim,ids,1:1)
-ys_r4glob = read_sums("test1_hh_16/sim_MD_p010_4_res_to_glob",xlim,ids,1:1)
-
-plot(xs, hcat(ys_cN_h16,ys_work4),legend=nothing, linecolor=hcat(fill(:black, 1, 3), fill(:red, 1, 3)))
-plot(xs, hcat(ys_cN_h16,ys_res4),legend=nothing, linecolor=hcat(fill(:black, 1, 3), fill(:red, 1, 1)))
-plot(xs, hcat(ys_cN_h16,ys_w4glob),legend=nothing, linecolor=hcat(fill(:black, 1, 3), fill(:red, 1, 1)))
-plot(xs, hcat(ys_cN_h16,ys_r4glob),legend=nothing, linecolor=hcat(fill(:black, 1, 3), fill(:red, 1, 1)))
 
 
 0
@@ -243,7 +289,7 @@ plot(xs, hcat(ys_base,ys_no_inc),legend=nothing,
 
 
 
-
+## community detection?
 
 g = watts_strogatz(100, 8, 0.25)
 g = barabasi_albert(1000, 4)
@@ -252,6 +298,7 @@ x = community_detection_bethe(g,6)
 [length(findall(a->a==i, x)) for i in 1:maximum(x)]
 
 ## try SBM for community detection
+
 
 
 r,c,v = findnz(sprand(1000,1000,0.1))
@@ -283,11 +330,12 @@ end
 @elapsed y = theirshuffle(x)
 
 
-
-## access columns, not rows
+##
+## access columns, not rows (because Julia memory layout)
+##
 @elapsed v = full_net[:,2]
 
-## these are fast
+## these are fast (O1)
 @elapsed findnz(full_net)
 @elapsed findall(full_net)
 
@@ -312,14 +360,16 @@ f = sum(full_net,dims=1);
 
 
 
+## debugging event handler code
 
-
-unit_ids = [2,3,4]
-inputs = modelInputs(unit_ids; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI);
-id = 3
+inputs = modelInputs(unit_ids; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI,
+    flags=[:w_test],
+    distr_params_hh=(8,), distr_params_non_hh=(6,), distr_fn_loc_work=:const, distr_params_loc_work=(2,));
 in_chans = Dict(i => RemoteChannel(()->Channel{Vector{simEvent}}(1), i) for i in unit_ids)
 out_chans = Dict(i => RemoteChannel(()->Channel{Vector{simEvent}}(1), i) for i in unit_ids)
 report_chans = Dict(i => RemoteChannel(()->Channel{Any}(100), i) for i in unit_ids)
+
+id = 3
 u = simUnit(in_chans[id], out_chans[id], report_chans[id])
 u[:id] = id ## just for debugging?
 init_sim_unit!(u, id, inputs) ## this fn adds domain-specific data and queues initial events
@@ -346,3 +396,90 @@ for i in 1:50
     end
 end
 
+
+
+
+
+
+## graph partitioning by home cbg
+## (this decreases # messages passed, but overall performance is the same b/c partitions not balanced)
+## (balanced graph partitioning is NP-hard; but see approx algo Andreev 2004)
+
+
+hh = dser_path("jlse/hh.jlse") ## households/residents (with hh locations)
+gqs = dser_path("jlse/gqs.jlse") ## group-quarters/residents (with gq locations)
+cbg_k = dser_path("jlse/cbg_idxs.jlse") ## location (cbg) keys used in person/hh keys
+p_keys = dser_path("jlse/adj_mat_keys.jlse")
+p_idxs = Dict(p_keys .=> eachindex(p_keys))
+
+h_df_by_loc = groupby(DataFrame((k[2], v.people) for (k,v) in hh), "1")
+hh_ppl_by_loc = Dict(loc["1"]=>reduce(vcat, h_df_by_loc[loc][!,"2"]) for loc in keys(h_df_by_loc))
+hh_idxs_by_loc = Dict(k=>[p_idxs[i] for i in v] for (k,v) in hh_ppl_by_loc)
+
+gq_df_by_loc = groupby(DataFrame((k[2], v.residents) for (k,v) in gqs), "1")
+gq_ppl_by_loc = Dict(loc["1"]=>reduce(vcat, gq_df_by_loc[loc][!,"2"]) for loc in keys(gq_df_by_loc))
+gq_idxs_by_loc = Dict(k=>[p_idxs[i] for i in v] for (k,v) in gq_ppl_by_loc)
+
+## residential locations include households and non-inst GQs:
+res_idxs_by_loc = vecmerge(hh_idxs_by_loc, gq_idxs_by_loc)
+
+sum(length.(values(res_idxs_by_loc)))
+
+work_dummies = dser_path("jlse/work_dummies.jlse")
+dummy_idxs = [p_idxs[k[1:3]] for k in work_dummies]
+res_idxs_by_loc[0] = dummy_idxs
+
+sum(length.(values(res_idxs_by_loc)))
+
+cbg_k[0] = "outside"
+res_idxs_by_loc = Dict(cbg_k[k]=>v for (k,v) in res_idxs_by_loc)
+
+ser_path("p_idxs_all_by_h_cbg.jlse", res_idxs_by_loc)
+
+
+
+
+using Clustering
+assign_dict = Dict(i => UInt32[] for i in unit_ids)
+
+let
+    res_idxs_by_loc = dser_path("p_idxs_all_by_h_cbg.jlse")
+    d = read_df("../sim-netw/processed/work_od_matrix_no_inc.csv";types=Dict("h_cbg"=>String15))
+    home_labels = d[:,1]
+    M = Matrix{Float64}(d[!,2:end])
+    M = Matrix(M') ## home cbg as columns
+    result = kmeans(M, n_units; maxiter=500, tol=1.0e-7)
+
+    cluster_idx = Dict(home_labels .=> result.assignments)
+    cluster_idx["outside"] = argmin(result.counts) ## put these wherever for now
+    for (k,v) in res_idxs_by_loc
+        append!(assign_dict[unit_ids[cluster_idx[k]]], v)
+    end
+end
+
+assign_dict
+[(k,length(v)) for (k,v) in assign_dict]
+
+
+
+using Distributions
+using StatsPlots
+
+p2 = Poisson(2)
+mean(p2)
+median(p2)
+std(p2)
+boxplot(rand(p2,1000000))
+
+e2 = Exponential(2.0)
+mean(e2)
+median(e2)
+std(e2)
+violin(rand(e2,1000000))
+boxplot(rand(e2,100000))
+
+g2 = Geometric(1/(1+2.0))
+mean(g2)
+median(g2)
+std(g2)
+boxplot([rand(e2,100000) rand(g2,100000)])
