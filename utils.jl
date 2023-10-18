@@ -3,6 +3,12 @@ using StatsBase
 using InlineStrings
 using SparseArrays
 
+## make dicts callable, with a closure to handle missing keys
+(d::AbstractDict)(x,f::Base.Callable) = get(f,d,x)
+
+## subset of dict by keys
+dsubset(d::Dict{K,V},s) where {K<:Any,V<:Any} = Dict{K,V}(k=>d[k] for k in intersect(keys(d),s))
+
 ## shuffle a boolean sparsematrix, columnwise
 function colshuffle(x::SparseMatrixCSC{Bool, Int64})
     idxs = axes(x,1)
@@ -123,7 +129,7 @@ const Pnum = UInt32
 const Hkey = Tuple{Hnum,CBGkey}
 const Pkey = Tuple{Pnum,Hnum,CBGkey}
 const GQkey = Tuple{UInt16,CBGkey}
-const WRKkey = Tuple{UInt32, String31}
+const WRKkey = Tuple{UInt32, UInt8, String31}
 
 struct PersonData
     hh::Hkey
@@ -132,7 +138,9 @@ struct PersonData
     female::Union{Missing,Bool}
     working::Bool
     commuter::Bool
-    job_listed::Union{Missing,Bool}
+    #job_listed::Union{Missing,Bool}
+    com_LODES_low::Bool ## commutes to <40k/yr job
+    com_LODES_high::Bool ## commutes to >40k/yr job
     sch_grade::Union{Missing,String3}
 end
 

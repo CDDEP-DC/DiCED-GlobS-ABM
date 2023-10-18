@@ -4,7 +4,7 @@ include("fileutils.jl")
 
 ## remote workers need these definitions
 ##
-## NOTE : remote workers currently don't have utils.jl (to save memory)
+## NOTE : remote workers currently don't have utils.jl (to save memory, loading libraries)
 ##
 @everywhere begin
 
@@ -50,6 +50,47 @@ mutable struct reportingEvent <: simEvent
     const t::UInt32
 end
 
+## separate handler for infecting people while on holiday
+mutable struct becomeHolidayContagious <: simEvent
+    const t::UInt32
+    const agentid::UInt32
+end
+
+## struct that stores data within a SimUnit
+## (this could have just been a single dict, but this way the types are identified, helps the compiler)
+mutable struct SimData <: abstractSimData
+    netw::Dict{Symbol,SparseMatrixCSC{Bool,UInt32}} ## together in a dict so they can be treated as a collection
+    sets::Dict{Symbol,Set{UInt32}} ## which agents belong to this sim unit, along with any subsets
+    inf_probs::Dict{Symbol,Float64} ## store in a dict so a different one can be associated with each network
+    distr_fns::Dict{Symbol,Function} ## ditto for fns used to determine contact events
+    distr_params::Dict{Symbol,Tuple} ## params for those fns
+    loc_lookup::Dict{Symbol,Dict{UInt32,UInt32}} ## for indexing ephemeral contact networks by location
+
+    n_agents::Int
+    I_set::Set{UInt32} ## current infected
+    R_set::Set{UInt32} ## current recovered
+    t_recovery::UnitRange{Int64} ## range of recovery times
+    report_freq::UInt32
+    periodic_stuff_period::UInt32 ## mainly for updating out-of-network infections
+
+    dummies_assigned::Vector{UInt32} ## workers without households; special logic needed; vector because randsubseq can't handle Set
+    outw_assigned::Vector{UInt32} ## workers without workplaces
+    mean_hh_connections::Float64 ## mainly for the dummies
+    mean_wp_connections::Float64 ## mainly for out-workers
+
+    report_groups::Vector{Symbol} ## sets for which data should be reported
+    cumI::Dict{Symbol,Int} ## cumulative infection counts for each set
+    report_series::Dict{Symbol,Vector{Int}} ## dict of time series for reporting
+    geo_assigned::Dict{UInt32,UInt16} ## for tracking # infections by home location
+    cumI_by_geo::Vector{Int} ## each location is a vector index
+    report_by_geo::Vector{Vector{Int}} ## time series by geo; each location is a vector index
+
+    intervals::Dict{Symbol, UnitRange{Int64}} ## time intervals for special treatment; holidays etc
+    flags::Set{Symbol} ## misc boolean flags, mainly for testing
+    ## constructor returns an empty struct; filled using external inputs by init_sim_unit fn below
+    SimData() = new()
+end
+
 ##
 ## event handlers, dispatch on event type
 ## worker loop expects these functions to return future events as a Vector{simEvent}
@@ -59,23 +100,17 @@ end
 ## add code to existing events (e.g., increment case count in E->I event)
 ##  and queue a "data summary" event similar to sync event
 
-function handle_event!(local_sim::SimUnit, e::infectionEvent)::Vector{simEvent}
-    ## target may be in another sim unit, so no state change yet
+function handle_event!(u::SimUnit, e::infectionEvent)::Vector{simEvent}
+    ## this event could have occurred in another simunit, in the past; that's ok because nothing has happened yet
     ## just return an event for the target to become contagious at the correct time
     ## (note if an agent becomes infected twice, the earlier one will take effect & the later will do nothing)
-    return [becomeContagious(e.t + local_sim[:t_inc], e.agentid)]
+    effect_time::UInt32 = e.t + u.t_inc
+    #if in(effect_time, u.d.intervals[:holiday])
+    #    return [becomeHolidayContagious(effect_time, e.agentid)]
+    #else
+    return [becomeContagious(effect_time, e.agentid)]
+    #end
 end
-
-## no longer doing it this way
-## Bernouilli sampling, everyone in "neigh" has probability p of becoming infected
-#function infect_Bern(neigh::Vector{UInt32}, p::Float64)::Vector{UInt32}
-#    return randsubseq(neigh, p) ## fn provided by Random, promises efficient Bernouilli sampling
-#end
-## people encounter some contacts often, others not at all
-## overall transmission prob same as bern, but small # of transmissions more likely
-#function infect_clumped(neigh::Vector{UInt32}, p::Float64)::Vector{UInt32}
-#    return unique(randsubseq(rand(neigh,length(neigh)), p)) ## rand() samples with replacement
-#end
 
 ##
 ## functions used in becomeContagious handler to specify the distribution of contacts
@@ -112,73 +147,182 @@ function distr_zero(neigh::AbstractVector{I}, params::T)::Vector{UInt32} where {
     return UInt32[]
 end
 
+## if keeping overall contact rate constant, don't allow mean loc contacts to be greater than # neighbors
+function w_test_params(d::SimData,i::Integer)
+    N_work_neigh = nnz(view(d.netw[:wp],:,i))
+    params_loc_work = (get(d.distr_params[:loc_work],1,0) > N_work_neigh) ? 
+        (N_work_neigh, d.distr_params[:loc_work][2:end]...) : 
+        d.distr_params[:loc_work]
+    params_nonloc = (get(d.distr_params[:nonloc],1,0) > N_work_neigh) ?
+        (N_work_neigh, d.distr_params[:nonloc][2:end]...) :
+        d.distr_params[:nonloc]
+    return (params_loc_work, params_nonloc)
+end
+function h_test_params(d::SimData,i::Integer)
+    N_res_neigh = nnz(view(d.netw[:hh],:,i)) + nnz(view(d.netw[:gq],:,i))
+    params_loc_res = (get(d.distr_params[:loc_res],1,0) > N_res_neigh) ?
+        (N_res_neigh, d.distr_params[:loc_res][2:end]...) :
+        d.distr_params[:loc_res]
+    params_nonloc = (get(d.distr_params[:nonloc],1,0) > N_res_neigh) ?
+        (N_res_neigh, d.distr_params[:nonloc][2:end]...) :
+        d.distr_params[:nonloc]
+    return (params_loc_res,params_nonloc)
+end
+
+## if keeping overall contact rate constant, don't allow mean loc contacts to be greater than # neighbors
+function get_dparams(d::SimData, i::UInt32, keynames::Vector{Symbol})::Vector{Tuple}
+    tmp_copy = Dict{Symbol,Tuple}(k=>d.distr_params[k] for k in keynames)
+    if in(:w_test, d.flags)
+        tmp_copy[:loc_work], tmp_copy[:nonloc] = w_test_params(d,i)
+    end
+    if in(:h_test, d.flags)
+        tmp_copy[:loc_res], tmp_copy[:nonloc] = h_test_params(d,i)
+    end
+    return [tmp_copy[k] for k in keynames]
+end
+
+function resists_infection(i::UInt32, e::simEvent, d::SimData)::Bool
+    return in(i, d.I_set) || in(i, d.R_set) ## testing set membership is O(1)
+end
+
+function loc_res(d::SimData, i::UInt32)::UInt32
+    return get(d.loc_lookup[:res], i, UInt32(0))
+end
+function loc_work(d::SimData, i::UInt32)::UInt32
+    return get(d.loc_lookup[:work], i, UInt32(0))
+end
+
+## TODO
+function loc_holiday(d::SimData, i::UInt32)::UInt32
+    return UInt32(0)
+end
+
+function update_counts!(d::SimData, i::UInt32)
+    for k in d.report_groups
+        if i in d.sets[k] ## agent id belongs to this group
+            d.cumI[k] += 1
+        end
+    end
+    ## update geo vector
+    g = d.geo_assigned[i]
+    if g > 0 ## geo_assigned is 0 for dummies, who don't have a home location
+        d.cumI_by_geo[g] += 1
+    end
+end
+
+function network_infections(netw::A, col_idx::UInt32, distr_fn::F, distr_params::T, p_inf::Float64)::Vector{UInt32} where {A<:AbstractArray, F<:Function, T<:Tuple}
+    if col_idx > 0 ## index exists
+        if distr_fn == distr_zero ## avoid doing unnecessary work
+            return UInt32[]
+        else
+            neigh = findall(view(netw,:,col_idx)) ## note, findall() on a sparsearray is not really a "find", it's an O(1) lookup
+            contacts = distr_fn(neigh, distr_params)
+            return randsubseq(contacts,p_inf) ## randsubseq promises efficient Bernouilli sampling
+        end
+    else
+        return UInt32[]
+    end
+end
+
 ##
 ## the becomeContagious handler
 ##   if agent is susceptible, change state, and generate all future infection events that result
 ##
 function handle_event!(u::SimUnit, e::becomeContagious)::Vector{simEvent}
+    d = u.d
     i = e.agentid
-    if in(i, u[:I_set]) || in(i, u[:R_set]) ## testing set membership is O(1)
+    if resists_infection(i, e, u.d)
         return simEvent[] ## agent not susceptible
     else
-        u[:cum_I] += 1 ## update cumulative infection count
-        push!(u[:I_set], i) ## append to current infected set
-        duration = rand(u[:t_recovery])
+        push!(d.I_set, i) ## append to current infected set
+        update_counts!(u.d, i)
+        duration = rand(d.t_recovery)
+        recov_event = becomeRecovered(e.t + duration, i)
+        ## collect references to networks defined in the simunit (we will broadcast the infection fn over these)
+        networks = [d.netw[k] for k in [:hh, :wp, :sch, :gq, :loc_matrix_res, :loc_matrix_work]]
+        ## column = agent id, except location networks where it's a location index, and nonlocal "network" that's just 1 column
+        col_idxs = [i, i, i, i, loc_res(u.d,i), loc_work(u.d,i)]
+        ## distribution function for # of contacts in each network; currently using non-hh for gq's
+        distr_fns = [d.distr_fns[k] for k in [:hh, :non_hh, :non_hh, :non_hh, :loc_res, :loc_work]]
+        distr_params = get_dparams(u.d,i,[:hh, :non_hh, :non_hh, :non_hh, :loc_res, :loc_work])        
+        inf_ps::Vector{Float64} = [d.inf_probs[k] for k in [:p_inf_hh, :p_inf, :p_inf, :p_inf, :p_inf_loc, :p_inf_loc]]
+
+        ## make modifications based on whichever special time intervals are currently active
+        active_keys::Vector{Symbol} = [k for (k, i_range) in d.intervals if in(e.t, i_range)]
+        for i_key in active_keys
+            ## switch on i_key
+            if (i_key == :nonessential_wp_closed)
+                ## workplaces are closed except low income; disable wp and wp loc networks, unless agent is in low inc wp
+                in(i, d.sets[:low_inc_workplace]) || (col_idxs[[2,6]] .= 0) ## set col idx to 0 to exclude the network
+            
+            elseif (i_key == :sch_closed)
+                ## schools are closed; disable school network for students and work networks for teachers
+                col_idxs[3] = 0 ## school network only exists for k12 students
+                in(i, d.sets[:k12_worker]) && (col_idxs[[2,6]] .= 0)
+            end
+        end
+
+        ## f.() syntax broadcasts a fn over collections; returns a vector of f's return vals; those are vectors, so join them with reduce(vcat)
+        ##   unique() because infecting someone twice doesn't have any additional effect
+        infected::Vector{UInt32} = unique(reduce(vcat, network_infections.(networks, col_idxs, distr_fns, distr_params, inf_ps)))
+        infection_events = [infectionEvent(e.t + rand(0:duration), targ) for targ in infected]
+        ##
+        ## TODO: log number of secondary infections
+        ##
+
+        ## return infection events and recovery event
+        return [infection_events; recov_event]
+    end
+end
+
+
+## become contagious while on holiday
+##  cheat to keep the overall infection rate unchanged
+function handle_event!(u::SimUnit, e::becomeHolidayContagious)::Vector{simEvent}
+    d = u.d
+    i = e.agentid
+    if resists_infection(i, e, u.d)
+        return simEvent[] ## agent not susceptible
+    else
+        push!(d.I_set, i) ## append to current infected set
+        update_counts!(u.d, i)
+        duration = rand(d.t_recovery)
         recov_event = becomeRecovered(e.t + duration, i)
 
-        neigh_non_hh::Vector{UInt32} = findall(u[:netw_non_hh][:,i]) ## note, this is not really a "find", it's just a lookup in a sparse array
-        neigh_hh::Vector{UInt32} = findall(u[:netw_hh][:,i]) 
-
+        neigh_holiday::Vector{UInt32} = findall(view(d.netw[:holiday],:,i)) 
         ## possible ephemeral/location-based contacts
-        if haskey(u[:loc_lookup_res], i)
-            res_loc::UInt32 = u[:loc_lookup_res][i]
-            neigh_loc_res::Vector{UInt32} = findall(u[:loc_matrix_res][:,res_loc]) ## columns of this sparse matrix are locations
-        else
-            neigh_loc_res = UInt32[]
-        end
-        if haskey(u[:loc_lookup_work], i)
-            work_loc::UInt32 = u[:loc_lookup_work][i]
-            neigh_loc_work::Vector{UInt32} = findall(u[:loc_matrix_work][:,work_loc])
-        else
-            neigh_loc_work = UInt32[]
-        end
+        
+        neigh_loc_holiday::Vector{UInt32} = let loc_idx = loc_holiday(u.d,i); loc_idx > 0 ? findall(view(d.netw[:loc_matrix_holiday],:,loc_idx)) : UInt32[] end
 
-        contacts_non_hh::Vector{UInt32} = u[:distr_fn_non_hh](neigh_non_hh, u[:distr_params_non_hh])
-        contacts_hh::Vector{UInt32} = u[:distr_fn_hh](neigh_hh, u[:distr_params_hh])
+        ## cheat to keep the overall infection rate unchanged
+        ## doing this instead of just reading the params because distr fn might not really be a distr fn
+        neigh_hh::Vector{UInt32} = findall(view(d.netw[:hh],:,i)) 
+        neigh_wp::Vector{UInt32} = findall(view(d.netw[:wp],:,i)) 
+        neigh_sch::Vector{UInt32} = findall(view(d.netw[:sch],:,i)) 
+        neigh_gq::Vector{UInt32} = findall(view(d.netw[:gq],:,i)) 
+        neigh_loc_res::Vector{UInt32} = let loc_idx = loc_res(u.d,i); loc_idx > 0 ? findall(view(d.netw[:loc_matrix_res],:,loc_idx)) : UInt32[] end
+        neigh_loc_work::Vector{UInt32} = let loc_idx = loc_work(u.d,i); loc_idx > 0 ? findall(view(d.netw[:loc_matrix_work],:,loc_idx)) : UInt32[] end
+        N_contacts_hh = length(d.distr_fns[:hh](neigh_hh, d.distr_params[:hh]))
+        N_contacts_wp = length(d.distr_fns[:non_hh](neigh_wp, d.distr_params[:non_hh]))
+        N_contacts_sch = length(d.distr_fns[:non_hh](neigh_sch, d.distr_params[:non_hh]))
+        N_contacts_gq = length(d.distr_fns[:non_hh](neigh_gq, d.distr_params[:non_hh]))
+        N_contacts_loc_res = length(d.distr_fns[:loc_res](neigh_loc_res, d.distr_params[:loc_res]))
+        N_contacts_loc_work = length(d.distr_fns[:loc_work](neigh_loc_work, d.distr_params[:loc_work]))
 
-        ## if keeping overall contact rate constant, don't allow mean loc contacts to be greater than # neighbors
-        if u[:h_test] && (get(u[:distr_params_loc_res],1,0) > length(neigh_hh))
-            distr_params_loc_res = (length(neigh_hh), u[:distr_params_loc_res][2:end]...)
-        else
-            distr_params_loc_res = u[:distr_params_loc_res]
-        end
+        ## separate samples in case p_inf's are different
+        contacts_non_hh::Vector{UInt32} = rsamp(neigh_holiday, N_contacts_wp+N_contacts_sch+N_contacts_gq)
+        contacts_hh::Vector{UInt32} = rsamp(neigh_holiday, N_contacts_hh)
+        contacts_loc_res::Vector{UInt32} = rsamp(neigh_loc_holiday, N_contacts_loc_res)
+        contacts_loc_work::Vector{UInt32} = rsamp(neigh_loc_holiday, N_contacts_loc_work)
+        ## unchanged
+        #contacts_nonloc::Vector{UInt32} = d.distr_fns[:nonloc](axes(d.netw[:hh],1), d.distr_params[:nonloc]) 
 
-        if u[:w_test] && (get(u[:distr_params_loc_work],1,0) > length(neigh_non_hh))
-            distr_params_loc_work = (length(neigh_non_hh), u[:distr_params_loc_work][2:end]...)
-        else
-            distr_params_loc_work = u[:distr_params_loc_work]
-        end
-
-        if u[:h_test] && (get(u[:distr_params_nonloc],1,0) > length(neigh_hh))
-            distr_params_nonloc = (length(neigh_hh), u[:distr_params_nonloc][2:end]...)
-        elseif u[:w_test] && (get(u[:distr_params_nonloc],1,0) > length(neigh_non_hh))
-            distr_params_nonloc = (length(neigh_non_hh), u[:distr_params_nonloc][2:end]...)
-        else
-            distr_params_nonloc = u[:distr_params_nonloc]
-        end
-
-        contacts_loc_res::Vector{UInt32} = u[:distr_fn_loc_res](neigh_loc_res, distr_params_loc_res)
-        contacts_loc_work::Vector{UInt32} = u[:distr_fn_loc_work](neigh_loc_work, distr_params_loc_work)
-        ## anyone in the population is a potential nonlocal contact
-        contacts_nonloc::Vector{UInt32} = u[:distr_fn_nonloc](axes(u[:netw_non_hh],1), distr_params_nonloc) 
-        ## randsubseq promises efficient Bernouilli sampling
-        ##   unique() because infecting someone twice doesn't have any additional effect
         infected::Vector{UInt32} = unique(vcat(
-            randsubseq(contacts_non_hh,u[:p_inf]),
-            randsubseq(contacts_hh,u[:p_inf_hh]),
-            randsubseq(contacts_loc_res,u[:p_inf_loc]),
-            randsubseq(contacts_loc_work,u[:p_inf_loc]),
-            randsubseq(contacts_nonloc,u[:p_inf_loc])))
+            randsubseq(contacts_non_hh,d.inf_probs[:p_inf]),
+            randsubseq(contacts_hh,d.inf_probs[:p_inf_hh]),
+            randsubseq(contacts_loc_res,d.inf_probs[:p_inf_loc]),
+            randsubseq(contacts_loc_work,d.inf_probs[:p_inf_loc])#,randsubseq(contacts_nonloc,d.inf_probs[:p_inf_loc])
+            ))
 
         infection_events = [infectionEvent(e.t + rand(0:duration), targ) for targ in infected]
         ##
@@ -188,24 +332,25 @@ function handle_event!(u::SimUnit, e::becomeContagious)::Vector{simEvent}
         ## return infection events and recovery event
         return [infection_events; recov_event]
     end
-
 end
 
-function handle_event!(local_sim::SimUnit, e::becomeRecovered)::Vector{simEvent}
+
+function handle_event!(u::SimUnit, e::becomeRecovered)::Vector{simEvent}
     ## change state; currently no future event
-    delete!(local_sim[:I_set], e.agentid) ## deleting from a set is O(1)
-    push!(local_sim[:R_set], e.agentid) ## add to recovered set
+    delete!(u.d.I_set, e.agentid) ## deleting from a set is O(1)
+    push!(u.d.R_set, e.agentid) ## add to recovered set
     return simEvent[]
 end
 
 ## periodStuff handles out-of-network infections (people who work or live outside of the synth area)
 function handle_event!(u::SimUnit, e::periodicStuff)::Vector{simEvent}
 
+    d = u.d
     ## proportion infected in unit's pop
     ##
     ## TODO: this doesn't actually estimate the proportion of the population infected, does that matter?
     ##
-    P_infected = length(u[:I_set]) / u[:n_agents]
+    P_infected = length(d.I_set) / d.n_agents
 
     ## mean number of infected home / work connections
     
@@ -213,42 +358,81 @@ function handle_event!(u::SimUnit, e::periodicStuff)::Vector{simEvent}
     ## TODO: add mean location-based contacts to this calculation
     ##
 
-    n_home = P_infected * u[:mean_hh_connections]
-    n_work = P_infected * u[:mean_wp_connections]
+    n_home = P_infected * d.mean_hh_connections
+    n_work = P_infected * d.mean_wp_connections
 
     ## prob of getting infected at home / work for person with unknown home / work connections
     ##  assumes we're checking every (mean contagious duration) days, and p_inf is on that time scale
-    p_not = 1.0 - u[:p_inf]
-    p_home = 1.0 - p_not^n_home
-    p_work = 1.0 - p_not^n_work
+    ##
+    ## TODO: this calculation assumes # of contacts = # of connections; use the distr_fn instead
+    ##
+    p_not_w = 1.0 - d.inf_probs[:p_inf]
+    p_not_h = 1.0 - d.inf_probs[:p_inf_hh]
+    p_home = 1.0 - p_not_h^n_home
+    p_work = 1.0 - p_not_w^n_work
+
+    ## suspend work infection during holiday time
+    #if in(e.t, d.intervals[:holiday])
+    #    p_work = 0.0
+    #end
+
+    outw_targets = d.outw_assigned
+    dumm_targets = d.dummies_assigned
 
     ## out-workers get infected at non-existent workplace; dummies get infected at nonexistent home 
-    infected = [randsubseq(u[:outw_assigned], p_work); 
-                randsubseq(u[:dummies_assigned], p_home)]
- 
+    infected = [randsubseq(outw_targets, p_work); randsubseq(dumm_targets, p_home)]
+
     ## time point is random between now and next time this event occurs
-    infection_events = [infectionEvent(e.t + rand(0:u[:periodic_stuff_period]-1), targ) for targ in infected]
+    stuff_period = d.periodic_stuff_period
+    infection_events = [infectionEvent(e.t + rand(0:stuff_period-1), targ) for targ in infected]
 
     ## queue for next period
-    q_event!(u, periodicStuff(e.t + u[:periodic_stuff_period]))
+    q_event!(u, periodicStuff(e.t + stuff_period))
     return infection_events
 end
 
 ## reporting
 function handle_event!(u::SimUnit, e::reportingEvent)::Vector{simEvent}
-
-    ## append number infected to log
-    push!(u[:log], (e.t, length(u[:I_set])))
-
+    d = u.d
+    ## append current counts to report series
+    push!(d.report_series[:active], length(d.I_set))
+    push!(d.report_series[:cumI], d.cumI[:agents_assigned])
+    push!(d.report_series[:cumI_low_inc_wp], d.cumI[:low_inc_workplace])
+    push!(d.report_by_geo, copy(d.cumI_by_geo)) ## copy vector to append current values
     ## queue for next period
-    q_event!(u, reportingEvent(e.t + u[:report_freq]))
+    q_event!(u, reportingEvent(e.t + d.report_freq))
     return simEvent[]
 end
+
+## tells local processes what to return at the end (returning the whole simunit might take too much memory)
+function summarize(u::SimUnit)
+    d = u.d
+    return Dict(
+        :active => d.report_series[:active], 
+        :cumI =>  d.report_series[:cumI], 
+        :cumI_low_inc_wp => d.report_series[:cumI_low_inc_wp],
+        :cumI_by_geo => d.report_by_geo,
+        :endR => length(d.R_set),
+        :q_len => length(u.q),
+        :glob_len => length(u.global_events),
+        :n_agents => d.n_agents
+    )
+end
+
+## event sorting
 
 ## periodStuff handler is written to generate events only for local agents,
 ## so send all events originating from periodStuff to the local queue
 ##  (dispatching on type of "orig" originating event; subtype dispatch takes precedence over supertype)
 function sort_events!(local_sim::SimUnit, orig::periodicStuff, events::Vector{simEvent})
+    for e in events
+        q_event!(local_sim, e)
+    end
+    return nothing
+end
+
+## infectionEvent generates a single contagious event, which is the same agent and therefore on the same unit
+function sort_events!(local_sim::SimUnit, orig::infectionEvent, events::Vector{simEvent})
     for e in events
         q_event!(local_sim, e)
     end
@@ -261,30 +445,18 @@ end
 function sort_events!(local_sim::SimUnit, orig::simEvent, events::Vector{simEvent})
 
     for e in events
-        if e.agentid in local_sim[:agents_assigned] ## this check is O(1)
+        if e.agentid in local_sim.d.sets[:agents_assigned] ## this check is O(1)
             q_event!(local_sim, e)
         else
-            push!(local_sim[:global_events], e)
+            push!(local_sim.global_events, e)
         end
     end
 
     return nothing
 end
 
-## tells local processes what to return at the end (returning the whole simunit might take too much memory)
-function summarize(u::SimUnit)
-    return Dict(
-        :cum_I => u[:cum_I],
-        :curr_I => length(u[:I_set]),
-        :curr_R => length(u[:R_set]),
-        :q_len => length(u[:q]),
-        :glob_len => length(u[:global_events]),
-        :n_agents => u[:n_agents],
-        :log => deepcopy(u[:log])
-    )
-end
-
 end ## @everywhere begin
+
 ## only the first worker (global sync overseer) gets the defintions below
 
 ## data needed to perform global sync
@@ -292,6 +464,18 @@ end ## @everywhere begin
 struct globalData <: abstractGlobData
     ## a vector indicating which sim unit owns every agent
     idxs::Vector{UInt8}
+end
+
+## globalData constructor, called in gabm.jl spawn_units!()
+## should return whatever sort_glob_events() needs
+function globalData(inputs)
+    g = zeros(UInt8,size(inputs[:netw_hh],2));
+    for (k,r) in inputs[:agents_assigned]
+        for i in collect(r)
+            g[i] = k
+        end
+    end
+    return globalData(g)
 end
 
 ## direct events from global queue to a local sim unit based on the criteria in this function
@@ -308,235 +492,301 @@ function sort_glob_events(glob_data::globalData, targets::Vector{Int64}, global_
     return d
 end
 
-## data needed to initialize sim units
-## all external inputs go into this struct, which the global process then uses to initialize local sim units
-##   parametric types T U V etc can be anything the functions below are written to handle
-##   (this didn't really need to be a struct, but it makes the syntax below cleaner)
-@kwdef struct modelInputs{U,V,W,Ta,Tb,Tc,Td,Te} <: abstractModelInputs
-    #netw::SparseMatrixCSC{Bool,UInt32}
-    netw_hh::SparseMatrixCSC{Bool,UInt32}
-    netw_non_hh::SparseMatrixCSC{Bool,UInt32}
-    loc_matrix_res::SparseMatrixCSC{Bool,UInt32}
-    loc_matrix_work::SparseMatrixCSC{Bool,UInt32}
-    loc_lookup_res::Dict{UInt32,UInt32}
-    loc_lookup_work::Dict{UInt32,UInt32}
-    agents_assigned::U
-    t_inc::Int64
-    p_inf::Float64
-    p_inf_hh::Float64
-    p_inf_loc::Float64
-    t_recovery::V
-    init_inf::Dict{Int64,Int64}
-    dummies_assigned::W
-    outw_assigned::W
-    mean_hh_connections::Float64
-    mean_wp_connections::Float64
-    report_freq::Int64
-    #infection_function::Symbol
-    distr_fn_hh::Symbol
-    distr_params_hh::Ta
-    distr_fn_non_hh::Symbol
-    distr_params_non_hh::Tb
-    distr_fn_loc_res::Symbol
-    distr_params_loc_res::Tc
-    distr_fn_loc_work::Symbol
-    distr_params_loc_work::Td
-    distr_fn_nonloc::Symbol
-    distr_params_nonloc::Te
-    flags::Set{Symbol}
+## mean household connections, excluding household-less dummies
+calc_mean_hh(netw_mat,exclude) = mean(sum(netw_mat[:,setdiff(axes(netw_mat,2), exclude)], dims=1))
+## mean workplace connections = mean non-hh cnxs for people with 1+ non-hh cnxs, excluding workplace-less out-workers
+calc_mean_wp(netw_mat,exclude) = mean(filter(x->x>0, sum(netw_mat[:,setdiff(axes(netw_mat,2), exclude)], dims=1)))
+
+## assigning agents to sim units; just random for now
+function agent_assignment(unit_ids::Vector{Int64}, nn::Int64)
+    n = length(unit_ids)
+    ## not really necessary to randomize but doesn't hurt
+    splits = ranges(lrRound(fill(nn/n, n)))
+    idxs = UInt32.(shuffle(1:nn))
+    return Dict(unit_ids .=> [idxs[i] for i in splits])
 end
 
-## constructor, called in gabm.jl spawn_units!()
+## data needed to initialize sim units;  called in gabm.jl spawn_units!()
+## all external inputs go into this dict, which the global process then uses to initialize local sim units
+## (this may seem a little convoluted, but it allows the main process to read in whatever data is needed,
+##    copy pieces to the local workers, and then delete this object to free up memory)
 function modelInputs(unit_ids::Vector{Int64}; kwargs...)
-
-    ## these funcs only evaluated when needed
-    read_dummies() = Set{UInt32}(keys(dser_path("jlse/adj_dummy_keys.jlse")))
-    read_outw() = Set{UInt32}(keys(dser_path("jlse/adj_out_workers.jlse")))
-    read_netw_hh() = (println("read hh net"); SparseMatrixCSC{Bool,UInt32}(Symmetric(dser_path("jlse/hh_adj_mat.jlse"))) )
-    read_netw_non_hh() = (println("read non-hh net"); SparseMatrixCSC{Bool,UInt32}(Symmetric(dser_path("jlse/adj_mat.jlse"))) )
-    read_loc_matrix_res() = (println("read res loc mat"); SparseMatrixCSC{Bool,UInt32}(dser_path("jlse/res_loc_contact_mat.jlse")) )
-    read_loc_matrix_work() = (println("read work loc mat"); SparseMatrixCSC{Bool,UInt32}(dser_path("jlse/work_loc_contact_mat.jlse")) )
-    read_loc_lookup_res() = Dict{UInt32,UInt32}(dser_path("jlse/res_loc_lookup.jlse"))
-    read_loc_lookup_work() = Dict{UInt32,UInt32}(dser_path("jlse/work_loc_lookup.jlse"))
-
-    ## mean household connections, excluding household-less dummies
-    calc_mean_hh(netw_hh,dummies) = (println("calc mean hh"); mean(sum(netw_hh[:,setdiff(axes(netw_hh,2), dummies)], dims=1)))
-    ## mean workplace connections = mean non-hh cnxs for people with 1+ non-hh cnxs, excluding workplace-less out-workers
-    calc_mean_wp(netw_non_hh,outw) = (println("calc mean wp"); mean(filter(x->x>0, sum(netw_non_hh[:,setdiff(axes(netw_non_hh,2), outw)], dims=1))))
-    ## for now, just join household and non-hh networks; keyword arg takes precedence if present
-    ## calc_full_net(netw_hh,netw_non_hh)::SparseMatrixCSC{Bool, UInt32} = (println("calc full net"); netw_hh .| netw_non_hh)
-
-    ## awkward syntax but avoids costly evaluation when kwargs has the key
-    netw_hh::SparseMatrixCSC{Bool, UInt32} = get(read_netw_hh, kwargs, :netw_hh)
-    netw_non_hh::SparseMatrixCSC{Bool, UInt32} = get(read_netw_non_hh, kwargs, :netw_non_hh)
-    loc_matrix_res::SparseMatrixCSC{Bool, UInt32} = get(read_loc_matrix_res, kwargs, :loc_matrix_res)
-    loc_matrix_work::SparseMatrixCSC{Bool, UInt32} = get(read_loc_matrix_work, kwargs, :loc_matrix_work)
-    loc_lookup_res::Dict{UInt32,UInt32} = get(read_loc_lookup_res, kwargs, :loc_lookup_res)
-    loc_lookup_work::Dict{UInt32,UInt32} = get(read_loc_lookup_work, kwargs, :loc_lookup_work)
-
+    ## note, calling kwargs like a fn is enabled by a definition in utils.jl
+    netw_hh = SparseMatrixCSC{Bool, UInt32}(kwargs(:netw_hh, ()->Symmetric(dser_path("jlse/adj_mat_hh.jlse"))))
+    netw_wp = SparseMatrixCSC{Bool, UInt32}(kwargs(:netw_wp, ()->Symmetric(dser_path("jlse/adj_mat_wp.jlse"))))
     ## dummies appear in work networks, but live outside the synth pop (no household or demographic info generated)
     ## local sim unit is responsible for determining if they got infected at home
-    dummies::Set{UInt32} = get(read_dummies, kwargs, :dummies)
+    dummies = Set{UInt32}(kwargs(:dummies, ()->keys(dser_path("jlse/adj_dummy_keys.jlse"))))
     ## outside workers have households, but no workplace network
     ## local sim unit is responsible for determining if they got infected at work
-    outw::Set{UInt32} = get(read_outw, kwargs, :out_workers)
-
-    mu_hh_cnx::Float64 = get(()->calc_mean_hh(netw_hh,dummies), kwargs, :mean_hh_connections)
-    mu_work_cnx::Float64 = get(()->calc_mean_wp(netw_non_hh,outw), kwargs, :mean_wp_connections)
-
-    ## assigning agents to sim units
-    if haskey(kwargs, :agents_assigned)
-        println("assignment ", [(k,length(v)) for (k,v) in kwargs[:agents_assigned]])
-        assign_idxs = kwargs[:agents_assigned]
-    else
-        println("random assignment")
-        ## TODO: optimize
-        n = length(unit_ids)
-        nn = size(netw_hh,2)
-        #assign_idxs = Dict(unit_ids .=> ranges(lrRound(fill(nn/n, n))))
-        ## not really necessary to randomize but doesn't hurt
-        splits = ranges(lrRound(fill(nn/n, n)))
-        idxs = UInt32.(shuffle(1:nn))
-        assign_idxs = Dict(unit_ids .=> [idxs[i] for i in splits])
-    end
-
-    assign_dummies = Dict(i => collect(intersect(dummies, assign_idxs[i])) for i in unit_ids)
-    assign_outw = Dict(i => collect(intersect(outw, assign_idxs[i])) for i in unit_ids)
+    outw = Set{UInt32}(kwargs(:out_workers, ()->keys(dser_path("jlse/adj_out_workers.jlse"))))
 
     println("returning model inputs")
     ## this constructor syntax is enabled by @kwdef macro above
-    return modelInputs(
-        netw_hh = netw_hh,
-        netw_non_hh = netw_non_hh,
-        loc_matrix_res = loc_matrix_res,
-        loc_matrix_work = loc_matrix_work,
-        loc_lookup_res = loc_lookup_res,
-        loc_lookup_work = loc_lookup_work,    
-        #netw = get(()->calc_full_net(netw_hh,netw_non_hh), kwargs, :full_net),
-        t_inc = get(kwargs, :t_inc, 5),
-        t_recovery = get(kwargs, :t_recovery, 8:12),
-        init_inf = Dict(get(kwargs, :init_inf, [first(unit_ids) => 10])),
-        agents_assigned = assign_idxs,
-        dummies_assigned = assign_dummies,
-        outw_assigned = assign_outw,
-        mean_hh_connections = mu_hh_cnx,
-        mean_wp_connections = mu_work_cnx,
-        report_freq = get(kwargs, :report_freq, 5),
-
+    return Dict(
+        :netw_hh => netw_hh,
+        :netw_wp => netw_wp,
+        :netw_sch => SparseMatrixCSC{Bool, UInt32}(kwargs(:netw_sch, ()->Symmetric(dser_path("jlse/adj_mat_sch.jlse")))),
+        :netw_gq => SparseMatrixCSC{Bool, UInt32}(kwargs(:netw_gq, ()->Symmetric(dser_path("jlse/adj_mat_gq.jlse")))),
+        :loc_matrix_res => SparseMatrixCSC{Bool,UInt32}(kwargs(:loc_matrix_res, ()->dser_path("jlse/res_loc_contact_mat.jlse"))),
+        :loc_matrix_work => SparseMatrixCSC{Bool,UInt32}(kwargs(:loc_matrix_work, ()->dser_path("jlse/work_loc_contact_mat.jlse"))),
+        :loc_lookup_res => Dict{UInt32,UInt32}(kwargs(:loc_lookup_res, ()->dser_path("jlse/res_loc_lookup.jlse"))),
+        :loc_lookup_work => Dict{UInt32,UInt32}(kwargs(:loc_lookup_work, ()->dser_path("jlse/work_loc_lookup.jlse"))),
+        :geo_lookup => Dict{UInt32,UInt16}(kwargs(:geo_lookup, ()->dser_path("precalc/cbg_idx_lookup.jlse"))),
+        :t_inc => UInt32(get(kwargs, :t_inc, 5)),
+        :t_recovery => get(kwargs, :t_recovery, 8:12),
+        :init_inf => get(kwargs, :init_inf, [first(unit_ids) => 10]),
+        :agents_assigned => kwargs(:agents_assigned, ()->agent_assignment(unit_ids, size(netw_hh,2))),
+        :dummies => dummies,
+        :out_workers => outw,
+        :commuters_to_low_inc_wp => Set{UInt32}(kwargs(:low_inc_workplace, ()->dser_path("precalc/low_inc_workplace.jlse"))),
+        :k12_worker => Set{UInt32}(kwargs(:k12_worker, ()->dser_path("precalc/k12_worker.jlse"))),
+        :mean_hh_connections => Float64(kwargs(:mean_hh_connections, ()->calc_mean_hh(netw_hh,dummies))),
+        :mean_wp_connections => Float64(kwargs(:mean_wp_connections, ()->calc_mean_wp(netw_wp,outw))),
+        :report_freq => UInt32(get(kwargs, :report_freq, 5)),
         ## defaults for within-household infection
-        p_inf_hh = get(kwargs, :p_inf_hh, 0.15), 
-        distr_fn_hh = get(kwargs, :distr_fn_hh, :const),
-        distr_params_hh = get(kwargs, :distr_params_hh, (16,)),
-
+        :p_inf_hh => get(kwargs, :p_inf_hh, 0.15), 
+        :distr_fn_hh => get(kwargs, :distr_fn_hh, :const),
+        :distr_params_hh => get(kwargs, :distr_params_hh, (16,)),
         ## defaults for work,school,GQ infection
-        p_inf = get(kwargs, :p_inf, 0.15),
-        distr_fn_non_hh = get(kwargs, :distr_fn_non_hh, :const),
-        distr_params_non_hh = get(kwargs, :distr_params_non_hh, (8,)),
-
+        :p_inf => get(kwargs, :p_inf, 0.15),
+        :distr_fn_non_hh => get(kwargs, :distr_fn_non_hh, :const),
+        :distr_params_non_hh => get(kwargs, :distr_params_non_hh, (8,)),
         ## defaults for ephemeral/location-based infection
-        p_inf_loc = get(kwargs, :p_inf_loc, 0.15),
-        distr_fn_loc_res = get(kwargs, :distr_fn_loc_res, :zero),
-        distr_params_loc_res = get(kwargs, :distr_params_loc_res, ()),
-        distr_fn_loc_work = get(kwargs, :distr_fn_loc_work, :zero),
-        distr_params_loc_work = get(kwargs, :distr_params_loc_work, ()),
-        distr_fn_nonloc = get(kwargs, :distr_fn_nonloc, :zero),
-        distr_params_nonloc = get(kwargs, :distr_params_nonloc, ()),
-
+        :p_inf_loc => get(kwargs, :p_inf_loc, 0.15),
+        :distr_fn_loc_res => get(kwargs, :distr_fn_loc_res, :zero),
+        :distr_params_loc_res => get(kwargs, :distr_params_loc_res, ()),
+        :distr_fn_loc_work => get(kwargs, :distr_fn_loc_work, :zero),
+        :distr_params_loc_work => get(kwargs, :distr_params_loc_work, ()),
+        :distr_fn_nonloc => get(kwargs, :distr_fn_nonloc, :zero),
+        :distr_params_nonloc => get(kwargs, :distr_params_nonloc, ()),
+        ## special time intervals; missing by default
+        :nonessential_wp_closed => get(kwargs, :nonessential_wp_closed, missing),
+        :sch_closed => get(kwargs, :sch_closed, missing),
         ## misc flags
-        flags = Set(get(kwargs, :flags, Symbol[]))
+        :flags => Set(get(kwargs, :flags, Symbol[]))
         )
 end
 
-## globalData constructor, called in gabm.jl spawn_units!()
-## should return whatever sort_glob_events() needs
-function globalData(inputs::modelInputs)
-    g = zeros(UInt8,size(inputs.netw_hh,2));
-    for (k,r) in inputs.agents_assigned
-        for i in collect(r)
-            g[i] = k
+## queue initial infections when init_inf is [unit id => # infections]
+function q_init_inf!(u::SimUnit, init_inf::Vector{Pair{I,I}}) where I<:Integer
+    id = u.id
+    d_init = Dict(init_inf)
+    if haskey(d_init, id)
+        for i in rand(collect(u.d.sets[:agents_assigned]), d_init[id])
+            #q_event!(u, infectionEvent(1,i))
+            q_event!(u, becomeContagious(0,i))
         end
     end
-    return globalData(g)
 end
 
-## this fn is called from a fn in gabm.jl
+## queue initial infections when init_inf is a list of agent ids
+function q_init_inf!(u::SimUnit, init_inf::Vector{I}) where I<:Integer
+    for i in init_inf
+        if i in u.d.sets[:agents_assigned]
+            #q_event!(u, infectionEvent(1,i))
+            q_event!(u, becomeContagious(0,i))
+        end
+    end
+end
+
+## a subset of a sparse matrix, but keep size and indices unchanged
+## (everything else becomes zeros, which use no memory)
+function sp_col_subset(orig::SparseMatrixCSC{T,U}, col_idxs) where {T<:Any,U<:Integer}
+    r = spzeros(T,U,size(orig))
+    r[:,col_idxs] = copy(orig[:,col_idxs])
+    return r
+end
+
+## this fn is called once for each sim unit, from a fn in gabm.jl
 ## adds domain-specific data to a sim unit
 ## adds initial event(s) to queue (at least one unit must have an initial event)
-## (note, SimUnit type is currently just a Dict with symbol keys, can add any key needed by fns above)
-function init_sim_unit!(u::SimUnit, id::Int64, inputs::modelInputs)
+function init_sim_unit!(u::SimUnit, inputs::Dict{Symbol,Any})
 
+    id = u.id
     print("init sim unit ", id, "; ")
-    ## add state variables and parameters
-    #u[:netw] = spzeros(Bool,UInt32,size(inputs.netw)) ## zeros use no memory in a sparse array
-    #u[:netw][:,inputs.agents_assigned[id]] = copy(inputs.netw[:,inputs.agents_assigned[id]]) ## copy just the columns assigned to this unit
+    u.t_inc = inputs[:t_inc] ## defined for SimUnit not SimData, because global process needs it
 
-    u[:netw_hh] = spzeros(Bool,UInt32,size(inputs.netw_hh)) ## zeros use no memory in a sparse array
-    u[:netw_non_hh] = spzeros(Bool,UInt32,size(inputs.netw_non_hh)) ## zeros use no memory in a sparse array
-    u[:netw_hh][:,inputs.agents_assigned[id]] = copy(inputs.netw_hh[:,inputs.agents_assigned[id]]) ## copy just the columns assigned to this unit
-    u[:netw_non_hh][:,inputs.agents_assigned[id]] = copy(inputs.netw_non_hh[:,inputs.agents_assigned[id]]) ## copy just the columns assigned to this unit
-    
-    ## every sim unit needs these
-    u[:loc_matrix_res] = inputs.loc_matrix_res
-    u[:loc_matrix_work] = inputs.loc_matrix_work
-    u[:loc_lookup_res] = inputs.loc_lookup_res
-    u[:loc_lookup_work] = inputs.loc_lookup_work
+    d = SimData(); u.d = d ## make the struct and give sim unit the reference
+    agents_assigned = inputs[:agents_assigned][id]
 
-    u[:agents_assigned] = Set{UInt32}(inputs.agents_assigned[id]) ## should be something wih O(1) lookup, like Set or UnitRange
-    u[:n_agents] = length(u[:agents_assigned])
-    u[:dummies_assigned] = Vector{UInt32}(inputs.dummies_assigned[id]) ## vector because randsubseq can't handle Set
-    u[:outw_assigned] = Vector{UInt32}(inputs.outw_assigned[id]) ## vector because randsubseq can't handle Set
-    u[:cum_I] = 0
-    u[:I_set] = Set{UInt32}()
-    u[:R_set] = Set{UInt32}()
-    u[:t_inc] = inputs.t_inc
-    u[:t_recovery] = inputs.t_recovery
-    ## note, these are currently global means (not per sim unit)
-    u[:mean_hh_connections] = inputs.mean_hh_connections
-    u[:mean_wp_connections] = inputs.mean_wp_connections
+    d.n_agents = length(agents_assigned)
+    d.I_set = Set{UInt32}()
+    d.R_set = Set{UInt32}()
+    d.t_recovery = inputs[:t_recovery]
     ## infection probability is defined in terms of infectiousness duration, so 
     ##  update out-of-network infections on the same timescale so probabilities are correct
-    u[:periodic_stuff_period] = round(Int, mean(inputs.t_recovery))
-    u[:report_freq] = inputs.report_freq
+    d.periodic_stuff_period = round(UInt32, mean(inputs[:t_recovery]))
+    d.report_freq = inputs[:report_freq]
 
-    u[:p_inf] = inputs.p_inf
-    u[:p_inf_hh] = inputs.p_inf_hh
-    u[:p_inf_loc] = inputs.p_inf_loc
+    ## having many network matrices wastes memory because indices are repeated; could combine into an 8-bit binary
+    d.netw = Dict(
+        :hh => sp_col_subset(inputs[:netw_hh], agents_assigned),
+        :wp => sp_col_subset(inputs[:netw_wp], agents_assigned),
+        :sch => sp_col_subset(inputs[:netw_sch], agents_assigned),
+        :gq => sp_col_subset(inputs[:netw_gq], agents_assigned),
+        ### copy() will happen automatically anyway?
+        :loc_matrix_res => copy(inputs[:loc_matrix_res]), ## local ephemeral contacts by location; every sim unit needs the full matrix
+        :loc_matrix_work => copy(inputs[:loc_matrix_work]),
+        ## non-local contact network is everyone in the population, so just a single column of "trues" 
+        ## TODO: this wastes memory; but we're not currently using it
+        ## :nonlocal => SparseMatrixCSC{Bool, UInt32}(trues(size(inputs[:netw_hh], 1), 1))
+    )
 
-    ## which function to use for infections
-    ## no longer doing it this way
-    #opts = Dict(:bern=>infect_Bern,:clumped=>infect_clumped)
-    #u[:infect_fn] = get(opts, inputs.infection_function, infect_Bern)
-    #println("using infection function ", u[:infect_fn])
+    ## agent assignment and other membership groups
+    ##   if there are many of these, could change representation to bitmatrix or something 
+    d.sets = Dict(
+        :agents_assigned => Set{UInt32}(agents_assigned), ## must be something wih O(1) lookup
+        :low_inc_workplace => intersect(inputs[:commuters_to_low_inc_wp], agents_assigned),
+        :k12_worker => intersect(inputs[:k12_worker] , agents_assigned)
+    )
+
+    d.inf_probs = Dict(
+        :p_inf => inputs[:p_inf],
+        :p_inf_hh => inputs[:p_inf_hh],
+        :p_inf_loc => inputs[:p_inf_loc]
+    )
+
+    ## note, loc_lookup_res is missing inst gq residents (and dummies); loc_lookup_work has only commuters
+    d.loc_lookup = Dict(
+        :res => dsubset(inputs[:loc_lookup_res], agents_assigned), ## don't need everyone's lookup, save some memory
+        :work => dsubset(inputs[:loc_lookup_work], agents_assigned)
+    )
 
     ## which function to use to determine contact events
     opts = Dict(:all=>distr_all, :const=>distr_const, :zero=>distr_zero, :pois=>distr_pois, :exp=>distr_exp)
-    u[:distr_fn_hh] = get(opts, inputs.distr_fn_hh, distr_const)
-    u[:distr_params_hh] = inputs.distr_params_hh
-    u[:distr_fn_non_hh] = get(opts, inputs.distr_fn_non_hh, distr_const)
-    u[:distr_params_non_hh] = inputs.distr_params_non_hh
-    u[:distr_fn_loc_res] = get(opts, inputs.distr_fn_loc_res, distr_zero)
-    u[:distr_params_loc_res] = inputs.distr_params_loc_res
-    u[:distr_fn_loc_work] = get(opts, inputs.distr_fn_loc_work, distr_zero)
-    u[:distr_params_loc_work] = inputs.distr_params_loc_work
-    u[:distr_fn_nonloc] = get(opts, inputs.distr_fn_nonloc, distr_zero)
-    u[:distr_params_nonloc] = inputs.distr_params_nonloc
 
-    println("using contact functions ", u[:distr_fn_hh], " ", u[:distr_fn_non_hh], " ", u[:distr_fn_loc_res], " ", u[:distr_fn_loc_work], " ", u[:distr_fn_nonloc])
-    println("using contact params ", u[:distr_params_hh], " ", u[:distr_params_non_hh], " ", u[:distr_params_loc_res], " ", u[:distr_params_loc_work], " ", u[:distr_params_nonloc], " ", inputs.flags)
+    d.distr_fns = Dict(
+        :hh => get(opts, inputs[:distr_fn_hh], distr_const),
+        :non_hh => get(opts, inputs[:distr_fn_non_hh], distr_const),
+        :loc_res => get(opts, inputs[:distr_fn_loc_res], distr_zero),
+        :loc_work => get(opts, inputs[:distr_fn_loc_work], distr_zero),
+        :nonloc => distr_zero ## currently off; get(opts, inputs[:distr_fn_nonloc], distr_zero)
+    )
 
-    u[:h_test] = in(:h_test,inputs.flags)
-    u[:w_test] = in(:w_test,inputs.flags)
+    d.distr_params = Dict(
+        :hh => inputs[:distr_params_hh],
+        :non_hh => inputs[:distr_params_non_hh],
+        :loc_res => inputs[:distr_params_loc_res],
+        :loc_work => inputs[:distr_params_loc_work],
+        :nonloc => inputs[:distr_params_nonloc]
+    )
+
+    d.dummies_assigned = collect(UInt32, intersect(inputs[:dummies], agents_assigned)) ## collect() because randsubseq can't handle Set
+    d.outw_assigned = collect(UInt32, intersect(inputs[:out_workers], agents_assigned)) ## collect() because randsubseq can't handle Set
+    ## note, these are currently global means (not per sim unit)
+    d.mean_hh_connections = inputs[:mean_hh_connections]
+    d.mean_wp_connections = inputs[:mean_wp_connections]
+
+    ## groups for which data should be reported
+    d.report_groups = collect(keys(d.sets)) ## all groups by default
+    ## report cumulative infections for those groups
+    d.cumI = Dict(d.report_groups .=> 0)
+    ## initialize time series, modified in reporting event handler
+    d.report_series = Dict(k => Int[] for k in [:active, :cumI, :cumI_low_inc_wp])
+
+    ## for tracking # infections by home location
+    d.geo_assigned = dsubset(inputs[:geo_lookup], agents_assigned)
+    d.cumI_by_geo = zeros(Int, maximum(values(inputs[:geo_lookup])))
+    d.report_by_geo = Vector{Int}[]
+
+    ## include keys only for specified intervals
+    d.intervals = Dict{Symbol, UnitRange{Int64}}(k=>inputs[k] for k in 
+        [:nonessential_wp_closed, :sch_closed] if !ismissing(inputs[k]))
+    
+    d.flags = inputs[:flags]
+
+    println("using contact functions ", d.distr_fns[:hh], " ", d.distr_fns[:non_hh], " ", d.distr_fns[:loc_res], " ", d.distr_fns[:loc_work], " ", d.distr_fns[:nonloc])
+    println("using contact params ", d.distr_params[:hh], " ", d.distr_params[:non_hh], " ", d.distr_params[:loc_res], " ", d.distr_params[:loc_work], " ", d.distr_params[:nonloc], " ", d.flags)
 
     ## queue initial events
-    if haskey(inputs.init_inf, id)
-        for i in rand(inputs.agents_assigned[id], inputs.init_inf[id])
-            q_event!(u, infectionEvent(1,i))
-        end
-    end
-    q_event!(u, periodicStuff(u[:periodic_stuff_period]))
-    q_event!(u, reportingEvent(1))
+    q_init_inf!(u, inputs[:init_inf])
+    q_event!(u, periodicStuff(d.periodic_stuff_period))
+    q_event!(u, reportingEvent(1)) ## offset from sync
 
     return nothing
 end
+
+
+## pre-calculate stuff used in intialization
+
+function precalc_geo()
+    p_idxs = let k = dser_path("jlse/adj_mat_keys.jlse"); Dict(k .=> UInt32.(eachindex(k))); end
+    d = Dict(i=>k[3] for (k,i) in p_idxs)
+    ser_path("precalc/cbg_idx_lookup.jlse",d)
+    return nothing
+end
+
+## can store people in low-inc worplaces, schools, etc., as a set of network indices
+##   if using several of these sets, could save memory (with only a small performace cost) by combining
+##   them with agents_assigned into a single dict
+function precalc_sets()
+    p_idxs = let k = dser_path("jlse/adj_mat_keys.jlse"); Dict(k .=> UInt32.(eachindex(k))); end
+    wp_low_inc = let w = dser_path("jlse/company_workers.jlse"); filterk(x->x[2]==UInt8(1), w); end
+    people = dser_path("jlse/people.jlse")
+    work_dummies = dser_path("jlse/work_dummies.jlse")
+    sch_workers = dser_path("jlse/sch_workers.jlse")
+
+    println("calc stats")
+    ## find person keys in each category
+    commute_to_low_inc_wp = Set(p_idxs[k[1:3]] for k in reduce(vcat, collect(values(wp_low_inc))))
+
+    low_inc_and_commute = union(Set(p_idxs[k[1:3]] for k in keys(filterv(x->x.com_LODES_low, people))),
+        Set(p_idxs[k[1:3]] for k in filter(x->x[4]==1, work_dummies)))
+
+    p_in_school = Set(p_idxs[k[1:3]] for k in keys(filterv(p->(!ismissing(p.sch_grade) && !in(p.sch_grade, ["c","g"])), people)))
+    work_in_school = Set(p_idxs[k[1:3]] for k in reduce(vcat, collect(values(sch_workers))))
+    school_student_or_worker = union(p_in_school,work_in_school)
+    age65o = Set(p_idxs[k[1:3]] for k in keys(filterv(x->x.age>=65, people)))
+
+    ser_path("precalc/low_inc_workplace.jlse", commute_to_low_inc_wp)
+    ser_path("precalc/low_inc_commuter.jlse", low_inc_and_commute)
+    ser_path("precalc/k12_student.jlse", p_in_school)
+    ser_path("precalc/k12_worker.jlse", work_in_school)
+    ser_path("precalc/k12_student_or_worker.jlse", school_student_or_worker)
+    ser_path("precalc/age_65o.jlse", age65o)    
+    return nothing
+end
+
+function precalc_stats()
+    p_idxs = let k = dser_path("jlse/adj_mat_keys.jlse"); Dict(k .=> eachindex(k)); end
+    wp_low_inc = let w = dser_path("jlse/company_workers.jlse"); filterk(x->x[2]==UInt8(1), w); end
+    people = dser_path("jlse/people.jlse")
+    work_dummies = dser_path("jlse/work_dummies.jlse")
+    sch_workers = dser_path("jlse/sch_workers.jlse")
+
+    println("calc stats")
+    ## find person keys in each category
+    commute_to_low_inc_wp = Set(k[1:3] for k in reduce(vcat, collect(values(wp_low_inc))))
+
+    low_inc_and_commute = union(Set(keys(filterv(x->x.com_LODES_low, people))),
+        Set(k[1:3] for k in filter(x->x[4]==1, work_dummies)))
+
+    p_in_school = Set(keys(filterv(p->(!ismissing(p.sch_grade) && !in(p.sch_grade, ["c","g"])), people)))
+    work_in_school = Set(k[1:3] for k in reduce(vcat, collect(values(sch_workers))))
+    school_student_or_worker = union(p_in_school,work_in_school)
+    age65o = Set(keys(filterv(x->x.age>=65, people)))
+
+    ## boolean vector of category memberships for each person, stored as an 8-bit integer (to conserve memory)
+    ## the keys of this dict are each person's matrix index
+    statdict = Dict(UInt32(i) => UInt8(evalpoly(2,[in(k,s) for s in 
+        [keys(p_idxs), commute_to_low_inc_wp, low_inc_and_commute, p_in_school, school_student_or_worker, age65o]]))
+        for (k,i) in p_idxs)
+
+    ## store category names in the same order
+    statkeys = let x = [:exists, :low_inc_workplace, :low_inc_commuter, :k12_student, :k12_student_or_worker, :age_65o];
+        Dict(x .=> eachindex(x)) end
+
+    ser_path("precalc/person_stats.jlse", statdict)
+    ser_path("precalc/stat_keys.jlse",statkeys)
+    return nothing
+end
+
+## use bit arithmetic to check membership in category name k
+function check_stat(person_stats::Dict{UInt32,UInt8}, stat_keys::Dict{Symbol,Int}, person_idx::UInt32, k::Symbol)
+    return person_stats[person_idx] & (UInt8(1) << stat_keys[k] >> 1) != 0
+end
+
+
 
 

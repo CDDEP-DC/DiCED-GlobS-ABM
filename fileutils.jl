@@ -17,6 +17,7 @@ function dser_path(f::AbstractString)
 end
 
 function ser_path(f::AbstractString,obj::Any)
+    println("writing ", f)
     serialize(abspath(f), obj)
     return nothing
 end
