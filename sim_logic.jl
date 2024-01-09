@@ -696,8 +696,8 @@ function init_sim_unit!(u::SimUnit, inputs::Dict{Symbol,Any})
     
     d.flags = inputs[:flags]
 
-    println("using contact functions ", d.distr_fns[:hh], " ", d.distr_fns[:non_hh], " ", d.distr_fns[:loc_res], " ", d.distr_fns[:loc_work], " ", d.distr_fns[:nonloc])
-    println("using contact params ", d.distr_params[:hh], " ", d.distr_params[:non_hh], " ", d.distr_params[:loc_res], " ", d.distr_params[:loc_work], " ", d.distr_params[:nonloc], " ", d.flags)
+    println("using contact functions ", d.distr_fns[:hh], " ", d.distr_fns[:non_hh], " ", d.distr_fns[:loc_res], " ", d.distr_fns[:loc_work])
+    println("using contact params ", d.distr_params[:hh],d.inf_probs[:p_inf_hh], " ", d.distr_params[:non_hh],d.inf_probs[:p_inf], " ", d.distr_params[:loc_res],d.inf_probs[:p_inf_loc], " ", d.distr_params[:loc_work],d.inf_probs[:p_inf_loc], " ", d.flags)
 
     ## queue initial events
     q_init_inf!(u, inputs[:init_inf])
@@ -706,6 +706,10 @@ function init_sim_unit!(u::SimUnit, inputs::Dict{Symbol,Any})
 
     return nothing
 end
+
+
+
+
 
 
 ## pre-calculate stuff used in intialization

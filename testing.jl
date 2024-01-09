@@ -20,44 +20,33 @@ end
 
 t = 602
 I0 = [2=>100,3=>100,4=>100]
-pI = 0.12
-
-
-for i in 6:6
-    serialize("sim_MD_p0"*string(round(Int,pI*100))*"_base"*string(i)*".jlse", 
-    test(t; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI,
-    distr_fn_hh=:const, distr_fn_non_hh=:const, distr_params_hh=(6,), distr_params_non_hh=(8,), 
-    distr_fn_loc_res=:exp, distr_params_loc_res=(2,), distr_fn_loc_work=:zero, distr_params_loc_work=() 
-    ))
-    GC.gc()
-end
+pI = 0.1
 
 
 
-
-for i in 1:1
+for i in 2:3
     serialize("sim_MD_p0"*string(round(Int,pI*100))*"_open"*string(i)*".jlse", 
-    test(t; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI,
-    distr_fn_hh=:const, distr_fn_non_hh=:const, distr_params_hh=(6,), distr_params_non_hh=(6,), 
-    distr_fn_loc_res=:exp, distr_params_loc_res=(2,), distr_fn_loc_work=:exp, distr_params_loc_work=(2,) 
+    test(t; init_inf=I0, p_inf=pI, p_inf_hh=2.0*pI, p_inf_loc=pI,
+    distr_fn_hh=:all, distr_fn_non_hh=:all, distr_params_hh=(), distr_params_non_hh=(), 
+    distr_fn_loc_res=:exp, distr_params_loc_res=(4,), distr_fn_loc_work=:exp, distr_params_loc_work=(2,) 
     ))
     GC.gc()
 end
 
-for i in 1:1
+for i in 2:3
     serialize("sim_MD_p0"*string(round(Int,pI*100))*"_wp_closed"*string(i)*".jlse", 
-    test(t; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI, nonessential_wp_closed=100:400,
-    distr_fn_hh=:const, distr_fn_non_hh=:const, distr_params_hh=(6,), distr_params_non_hh=(6,), 
-    distr_fn_loc_res=:exp, distr_params_loc_res=(2,), distr_fn_loc_work=:exp, distr_params_loc_work=(2,) 
+    test(t; init_inf=I0, p_inf=pI, p_inf_hh=2.0*pI, p_inf_loc=pI, nonessential_wp_closed=100:400,
+    distr_fn_hh=:all, distr_fn_non_hh=:all, distr_params_hh=(), distr_params_non_hh=(), 
+    distr_fn_loc_res=:exp, distr_params_loc_res=(4,), distr_fn_loc_work=:exp, distr_params_loc_work=(2,) 
     ))
     GC.gc()
 end
 
-for i in 1:1
-    serialize("sim_MD_p0"*string(round(Int,pI*100))*"_wp_sch_closed"*string(i)*".jlse", 
-    test(t; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI, nonessential_wp_closed=100:400, sch_closed=100:400,
-    distr_fn_hh=:const, distr_fn_non_hh=:const, distr_params_hh=(6,), distr_params_non_hh=(6,), 
-    distr_fn_loc_res=:exp, distr_params_loc_res=(2,), distr_fn_loc_work=:exp, distr_params_loc_work=(2,) 
+for i in 2:3
+    serialize("sim_MD_p0"*string(round(Int,pI*100))*"_wp_sch_closed"*string(i)*".jlse",
+    test(t; init_inf=I0, p_inf=pI, p_inf_hh=2.0*pI, p_inf_loc=pI, nonessential_wp_closed=100:400, sch_closed=100:400,
+    distr_fn_hh=:all, distr_fn_non_hh=:all, distr_params_hh=(), distr_params_non_hh=(), 
+    distr_fn_loc_res=:exp, distr_params_loc_res=(4,), distr_fn_loc_work=:exp, distr_params_loc_work=(2,) 
     ))
     GC.gc()
 end
@@ -68,34 +57,91 @@ end
 distr_fn_hh=:const, distr_fn_non_hh=:const, distr_params_hh=(6,), distr_params_non_hh=(8,), 
 distr_fn_loc_res=:exp, distr_params_loc_res=(2,), distr_fn_loc_work=:zero, distr_params_loc_work=() 
 )
+for i in 6:6
+    serialize("sim_MD_p0"*string(round(Int,pI*100))*"_base"*string(i)*".jlse", 
+    test(t; init_inf=I0, p_inf=pI, p_inf_hh=pI, p_inf_loc=pI,
+    distr_fn_hh=:const, distr_fn_non_hh=:const, distr_params_hh=(6,), distr_params_non_hh=(8,), 
+    distr_fn_loc_res=:exp, distr_params_loc_res=(2,), distr_fn_loc_work=:zero, distr_params_loc_work=() 
+    ))
+    GC.gc()
+end
 
 
 using Plots
+using Shapefile
 
 ## read logs; arrange time series in matrix columns for Plots.plot()
-old_read_log(f::String,rep::Int) = deserialize(f*string(rep)*".jlse")[3]
+#old_read_log(f::String,rep::Int) = deserialize(f*string(rep)*".jlse")[3]
 ## stack reps, sum workers
-old_read_sums(f,xlim,ids,reps) = hcat([sum(reduce(hcat, [[t[2] for t in old_read_log(f,r)[i][1:xlim]] for i in ids]),dims=2) for r in reps]...)
+#old_read_sums(f,xlim,ids,reps) = hcat([sum(reduce(hcat, [[t[2] for t in old_read_log(f,r)[i][1:xlim]] for i in ids]),dims=2) for r in reps]...)
 
 read_log(f::String,rep::Int) = deserialize(f*string(rep)*".jlse")
-read_sums(f,xlim,ids,reps) = hcat([sum(reduce(hcat, [read_log(f,r)[i][:active][1:xlim] for i in ids]),dims=2) for r in reps]...)
-
-
+read_sums(f,xlim,ids,k,reps) = reduce(hcat, sum([read_log(f,r)[i][k][1:xlim] for i in ids]) for r in reps)
+plotk(ns::Int,nr::Int) = [:legend=>nothing, :bg=>"#e1e4e1",
+    :lc=>repeat(["#3b4b59" "#ed8008" "#736b1e" "#bf1b1b"][:,1:ns], inner=(1,nr)), 
+    :ls=>repeat([:dashdot :solid :dash :dashdot][:,1:ns], inner=(1,nr))]
+P(a,b)::Float64 = iszero(b) ? 0.0 : a/b
 
 r_inc = 5
 ids = 2:4
-
 xlim = floor(Int, 600/r_inc)
 xs = collect(1:xlim) .* r_inc;
 
+g_open = read_sums("sim_MD_p010_open",xlim,ids,:cumI_by_geo,1:3)
+g_wp = read_sums("sim_MD_p010_wp_closed",xlim,ids,:cumI_by_geo,1:3)
+g_wp_sch = read_sums("sim_MD_p010_wp_sch_closed",xlim,ids,:cumI_by_geo,1:3)
+g_open300 = mean(g_open[60,:])
+g_wp300 = mean(g_wp[60,:])
+g_wp_sch300 = mean(g_wp_sch[60,:])
+
+cbg_idxs = let k = dser_path("jlse/cbg_idxs.jlse"); Dict(String(v)=>Int(i) for (i,v) in k) end
+pop_by_cbg = let d = dser_path("precalc/p_idxs_all_by_h_cbg.jlse"); Dict(String(k)=>length(v) for (k,v) in d) end
+
+t = Shapefile.Table("tl_2019_24_bg/tl_2019_24_bg.shp")
+mask = (t.COUNTYFP .== "510")
+shapes = t.geometry[mask]
+cbg_codes = t.GEOID[mask]
+
+t = Shapefile.Table("tl_2019_11_bg/tl_2019_11_bg.shp")
+shapes = t.geometry
+cbg_codes = t.GEOID
+
+idxs = [get(cbg_idxs,k,-1) for k in cbg_codes]
+pops = [get(pop_by_cbg,k,0) for k in cbg_codes]
+
+g = g_wp300
+cumI = [get(g,i,0) for i in idxs]
+pI = reshape(P.(cumI,pops),1,:)
+
+let z=pI; k=:inferno; plot(shapes, fill=palette(k), fill_z=z, linecolor=palette(k), line_z=z, size=(800,800)) end
+
 
 #ys_old = old_read_sums("sim_MD_p012_base",xlim,ids,1:1)
-ys_base = read_sums("sim_MD_p012_base",xlim,ids,4:6)
+#ys_base = read_sums("sim_MD_p012_base",xlim,ids,4:6)
 
-plot(xs, ys_base, legend=nothing)
+#plot(xs, ys_base, legend=nothing)
 #plot(xs, [ys_old ys_base], legend=nothing, linecolor=[fill(:black, 1, 1) fill(:red, 1, 2)])
 
 
+a_open = read_sums("sim_MD_p010_open",xlim,ids,:active,1:3)
+a_wp = read_sums("sim_MD_p010_wp_closed",xlim,ids,:active,1:3)
+a_wp_sch = read_sums("sim_MD_p010_wp_sch_closed",xlim,ids,:active,1:3)
+plot(xs, [a_open a_wp a_wp_sch]; plotk(3,3)...)
+
+c_open = read_sums("sim_MD_p010_open",xlim,ids,:cumI,1:3)
+l_open = read_sums("sim_MD_p010_open",xlim,ids,:cumI_low_inc_wp,1:3)
+c_wp = read_sums("sim_MD_p010_wp_closed",xlim,ids,:cumI,1:3)
+l_wp = read_sums("sim_MD_p010_wp_closed",xlim,ids,:cumI_low_inc_wp,1:3)
+c_wp_sch = read_sums("sim_MD_p010_wp_sch_closed",xlim,ids,:cumI,1:3)
+l_wp_sch = read_sums("sim_MD_p010_wp_sch_closed",xlim,ids,:cumI_low_inc_wp,1:3)
+plot(xs, [c_open c_wp c_wp_sch]; plotk(3,3)...)
+
+plot(xs, [c_open l_open]; plotk(2,3)...)
+plot(xs, [c_wp l_wp]; plotk(2,3)...)
+plot(xs, [c_wp_sch l_wp_sch]; plotk(2,3)...)
+
+p_open = l_open ./ c_open; p_wp = l_wp ./ c_wp; p_wp_sch = l_wp_sch ./ c_wp_sch
+plot(xs, [p_open p_wp p_wp_sch]; plotk(3,3)...)
 
 
 
