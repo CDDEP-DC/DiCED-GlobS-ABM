@@ -55,20 +55,23 @@ end
 function handle_event!(local_sim::SimUnit, e::syncEvent)::Vector{simEvent}
     outchan::RemoteChannel = local_sim.outchan
     inchan::RemoteChannel = local_sim.inchan
+    t = timeof(e)
     ## note, currently put! blocks if global syncer hasn't taken the last thing we sent to outchan (shouldn't happen)
     ## sending global events only on sync, as a collection
     ##  (otherwise how will the global syncer know when all workers have processed a time period?)
     ## if outchan's memory is not on this worker, a copy is automatically made
     ## put!(outchan, local_sim.global_events)
     ## if outchan is local to this worker, need to make a copy:
+    (t < 6) && println("t = ", t, "; q len = ", length(local_sim.q), "; sending ",length(local_sim.global_events)," events; ")
     put!(outchan, deepcopy(local_sim.global_events))
+    (t < 6) && println("sent; receiving; ")
     ## either way, ok to delete:
     empty!(local_sim.global_events) 
     ##await incoming global events
     events::Vector{simEvent} = take!(inchan)
-    println("t = ", timeof(e), "; q len = ", length(local_sim.q), "; took ", length(events), " events from global")
+    println("t = ", t, "; q len = ", length(local_sim.q), "; took ", length(events), " events from global")
     ##queue the next sync
-    q_event!(local_sim, syncEvent(timeof(e) + local_sim.t_inc))
+    q_event!(local_sim, syncEvent(t + local_sim.t_inc))
     ## distributed garbage collection is not very smart
     GC.gc()
     ##return global events
@@ -89,17 +92,22 @@ end
 function process!(unit::SimUnit, tStop::UInt32)
 
     ## queue the first sync event (next will be queued by event handler)
+    println("called process!")
     q_event!(unit, syncEvent(unit.t_inc))
+    println("queued first sync event for t ",unit.t_inc)
     t = UInt32(0)
 
     while t < tStop
         ## get the next event in the queue, advance time
         ## note, the queue will never be empty because next sync event is always added
-        e, t = dequeue_pair!(unit.q)	
+        e, t = dequeue_pair!(unit.q)
+        (t < 6) && (t > 0) && println("dequeued ",typeof(e)," t ",t)	
         ## handle event; can change state, should generate and return future event(s)
         future_events = handle_event!(unit, e)
+        (t < 6) && (t > 0) && println("handled ",typeof(e)," t ",t)
         ## then, either add future event(s) to local queue or save to global sync cache
         sort_events!(unit, e, future_events)
+        (t < 6) && (t > 0) && println("sorted ",length(future_events)," future events ")
         ## note, no data reporting directly in this loop (it's an event loop, not a time loop)
     end
 
@@ -136,6 +144,7 @@ function spawn_units!(tStop::UInt32, unit_ids::Vector{Int64}, futures::Dict{Int6
         init_sim_unit!(u, inputs) ## this fn adds domain-specific data and queues initial events
         ## start process; this sends data to remote worker (note, data should not remain stored in memory of main process)
         futures[id] = remotecall(process!, id, u, tStop)
+        println("started process ",id)
     end
 
     return globalData(inputs) ## return data needed to sort global events among sim units
@@ -160,14 +169,18 @@ function run(tStop::Int, unit_ids::Vector{Int64}; kwargs...)
 
     glob_data = spawn_units!(UInt32(tStop), unit_ids, futures, in_chans, out_chans, report_chans; kwargs...)
     GC.gc()
-    
+    println("started all processes")
+
     ## handle global sync
     glob_dicts = Vector{Dict{Int64,Vector{simEvent}}}(undef,length(unit_ids))
     global_events = Dict{Int64,Vector{simEvent}}()
+    debug = true
     while true
         ## sort and store global events coming from each worker
         ## asyncmap() conveniently does this as each channel reports in
+        debug && println("waiting for output channels")
         asyncmap!(i->process_glob_channel(glob_data, unit_ids, out_chans[i]), glob_dicts, unit_ids)
+        debug && println("received all output channels")
         ## when all workers have reported, merge results into a single dict
         mergewith!(vcat, global_events, glob_dicts...)
         ## empty dict means all channels were closed (vs no events would produce a dict of empty vectors)
@@ -183,11 +196,14 @@ function run(tStop::Int, unit_ids::Vector{Int64}; kwargs...)
                 ## or maybe not, because we're not doing anything to "v" but only to the Dict its reference lives in?
                 ## put!(in_chans[k], deepcopy(v))
                 ## if channel is on remote worker, data is copied automatically:
+                debug && println("sending to input channel ",k)
                 put!(in_chans[k], v)
+                debug && println("sent to input channel ",k)
             catch e
-                println("channel ", k, " prematurely closed")
+                println("channel ", k, " already closed")
             end
         end
+        debug = false
         ## using mergewith!(), so empty for next loop:
         empty!(global_events)
         ## ugh distributed GC
