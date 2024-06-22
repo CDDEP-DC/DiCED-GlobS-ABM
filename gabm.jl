@@ -62,9 +62,9 @@ function handle_event!(local_sim::SimUnit, e::syncEvent)::Vector{simEvent}
     ## if outchan's memory is not on this worker, a copy is automatically made
     ## put!(outchan, local_sim.global_events)
     ## if outchan is local to this worker, need to make a copy:
-    (t < 6) && println("t = ", t, "; q len = ", length(local_sim.q), "; sending ",length(local_sim.global_events)," events; ")
+    #(t < 6) && println("t = ", t, "; q len = ", length(local_sim.q), "; sending ",length(local_sim.global_events)," events; ")
     put!(outchan, deepcopy(local_sim.global_events))
-    (t < 6) && println("sent; receiving; ")
+    #(t < 6) && println("sent; receiving; ")
     ## either way, ok to delete:
     empty!(local_sim.global_events) 
     ##await incoming global events
@@ -87,35 +87,54 @@ function sort_events!(local_sim::SimUnit, orig::syncEvent, events::Vector{simEve
 end
 
 ## this is the main worker loop that runs local sim processes
-## spawning this function is also how sim data (inside "unit") is sent to a processor
-## (refs to inter-process comm channels are also inside "unit")
+## (refs to inter-process comm channels are inside "unit")
 function process!(unit::SimUnit, tStop::UInt32)
 
     ## queue the first sync event (next will be queued by event handler)
     println("called process!")
     q_event!(unit, syncEvent(unit.t_inc))
-    println("queued first sync event for t ",unit.t_inc)
+    #println("queued first sync event for t ",unit.t_inc)
     t = UInt32(0)
 
     while t < tStop
         ## get the next event in the queue, advance time
         ## note, the queue will never be empty because next sync event is always added
         e, t = dequeue_pair!(unit.q)
-        (t < 6) && (t > 0) && println("dequeued ",typeof(e)," t ",t)	
+        #(t < 6) && (t > 0) && println("dequeued ",typeof(e)," t ",t)	
         ## handle event; can change state, should generate and return future event(s)
         future_events = handle_event!(unit, e)
-        (t < 6) && (t > 0) && println("handled ",typeof(e)," t ",t)
+        #(t < 6) && (t > 0) && println("handled ",typeof(e)," t ",t)
         ## then, either add future event(s) to local queue or save to global sync cache
         sort_events!(unit, e, future_events)
-        (t < 6) && (t > 0) && println("sorted ",length(future_events)," future events ")
+        #(t < 6) && (t > 0) && println("sorted ",length(future_events)," future events ")
         ## note, no data reporting directly in this loop (it's an event loop, not a time loop)
     end
 
     println("done")
-    ## close channels here so global syncer will know this worker is done
     close(unit.inchan); close(unit.outchan); close(unit.reportchan)
     return summarize(unit) ## summarize() must be defined with sim logic
 end
+
+## called by main process to start remote worker
+## sim data is sent on ch_i
+function launcher(ch_i::RemoteChannel, tStop::UInt32)
+    ## wait for data on input channel
+    u::SimUnit = take!(ch_i)
+    close(ch_i) ## done with channel
+    ch_o = RemoteChannel(()->Channel{Any}(1)) ## channel for returning result
+    ## spawn process
+    t = @async begin
+        res = process!(u, tStop)
+        put!(ch_o, res)
+        close(ch_o) ## can still take from closed channel
+    end
+    ## make sure it actually worked; otherwise this will return without error
+    timedwait(()->istaskstarted(t), 10.0)
+    istaskfailed(t) && error("process! task failed")
+    ## return the output channel
+    return ch_o
+end
+
 
 end ## @everywhere begin
 
@@ -123,28 +142,50 @@ end ## @everywhere begin
 abstract type abstractGlobData end ## concrete type must be defined with sim logic
 
 ## receives global events from remote channel, returns a dict specifying which sim unit gets which events
-function process_glob_channel(glob_data::U, targets::Vector{Int64}, ch::RemoteChannel{V})::Dict{Int64,Vector{simEvent}} where U<:abstractGlobData where V<:Any
+function process_glob_channel(glob_data::U, targets::Vector{Int}, ch::RemoteChannel{V})::Dict{Int,Vector{simEvent}} where U<:abstractGlobData where V<:Any
     try
         global_events::Vector{simEvent} = take!(ch)
         return sort_glob_events(glob_data, targets, global_events) ## must be defined along with event handlers
     catch e
-        return Dict{Int64,Vector{simEvent}}() ## empty dict if channel closed
+        return Dict{Int,Vector{simEvent}}() ## empty dict if channel closed
     end
 end
 
 ## create sim units, initialize with data and comm channels, and send to processors
 ##   tStop: remote workers need to know when to stop
 ##   puts handles to remote processes in "futures"
-function spawn_units!(tStop::UInt32, unit_ids::Vector{Int64}, futures::Dict{Int64, Future}, in_chans::Dict{Int64, RemoteChannel{U}}, out_chans::Dict{Int64, RemoteChannel{U}}, report_chans::Dict{Int64, RemoteChannel{V}}; kwargs...) where {U,V}
+function spawn_units!(tStop::UInt32, unit_ids::Vector{Int}, result_chans::Dict{Int, RemoteChannel}, in_chans::Dict{Int, RemoteChannel{U}}, out_chans::Dict{Int, RemoteChannel{U}}, report_chans::Dict{Int, RemoteChannel{V}}; kwargs...) where {U,V}
 
     inputs = modelInputs(unit_ids; kwargs...)
 
     for id in unit_ids
         u = SimUnit(id, in_chans[id], out_chans[id], report_chans[id])
-        init_sim_unit!(u, inputs) ## this fn adds domain-specific data and queues initial events
-        ## start process; this sends data to remote worker (note, data should not remain stored in memory of main process)
-        futures[id] = remotecall(process!, id, u, tStop)
-        println("started process ",id)
+        ## this fn adds domain-specific data and queues initial events
+        init_sim_unit!(u, inputs) 
+
+        ## try several times to start the remote process (note, retry returns a function)
+        start_fn = retry(delays=Base.ExponentialBackOff(n=5)) do
+            ## create a channel for sending simunit to remote worker
+            ch_i = RemoteChannel(()->Channel{SimUnit}(1), id)
+            ## launcher(ch_i, tStop) returns a channel where remote worker writes the result
+            ## note, if this throws an error on the remote worker, the error only shows up on fetch(f)
+            f = remotecall(launcher, id, ch_i, tStop)
+            ## this part is only in a try block in case clean-up is needed on failure
+            try
+                ## remote worker is expecting data on ch_i; will start once it gets it
+                put!(ch_i, u)
+                ## should now be able to fetch result channel
+                result_chans[id] = fetch(f)
+                println("started process ",id)
+            catch e
+                println("retrying ",id," ",e)
+                finalize(f) ## this shuts down the remote process? docs are unclear
+                close(ch_i)
+                finalize(ch_i) ## not sure this is necessary
+                rethrow() ## propagate the error so that retry is triggered
+            end
+        end
+        start_fn()
     end
 
     return globalData(inputs) ## return data needed to sort global events among sim units
@@ -152,7 +193,7 @@ end
 
 ## "main" loop that handles global sync
 ## do not put any sim logic in there
-function run(tStop::Int, unit_ids::Vector{Int64}; kwargs...)
+function run(tStop::Int, unit_ids::Vector{Int}; kwargs...)
 
     ## channels used for global sync
     ## by default, these channels' memory exists on the local process; when a remote process put!s to the
@@ -164,16 +205,16 @@ function run(tStop::Int, unit_ids::Vector{Int64}; kwargs...)
     out_chans = Dict(i => RemoteChannel(()->Channel{Vector{simEvent}}(1), i) for i in unit_ids)
     ## don't use report chan unless needed; more memory copying
     report_chans = Dict(i => RemoteChannel(()->Channel{Any}(100), i) for i in unit_ids)
-    ## spawning a remote process returns a Future; store them here
-    futures = Dict{Int64, Future}() 
+    ## spawning a remote process returns a channel for results; store them here
+    result_chans = Dict{Int, RemoteChannel}() 
 
-    glob_data = spawn_units!(UInt32(tStop), unit_ids, futures, in_chans, out_chans, report_chans; kwargs...)
+    glob_data = spawn_units!(UInt32(tStop), unit_ids, result_chans, in_chans, out_chans, report_chans; kwargs...)
     GC.gc()
     println("started all processes")
 
-    ## handle global sync
-    glob_dicts = Vector{Dict{Int64,Vector{simEvent}}}(undef,length(unit_ids))
-    global_events = Dict{Int64,Vector{simEvent}}()
+    ## start a loop to handle global sync
+    glob_dicts = Vector{Dict{Int,Vector{simEvent}}}(undef,length(unit_ids))
+    global_events = Dict{Int,Vector{simEvent}}()
     debug = true
     while true
         ## sort and store global events coming from each worker
@@ -189,7 +230,7 @@ function run(tStop::Int, unit_ids::Vector{Int64}; kwargs...)
         end
 
         ## send to designated workers (no need to do this async)
-        for (k::Int64, v::Vector{simEvent}) in global_events
+        for (k::Int, v::Vector{simEvent}) in global_events
             #println("putting ", length(v), " events on inchan ", k)
             try
                 ## if channel is local, probably need to make a copy
@@ -209,23 +250,19 @@ function run(tStop::Int, unit_ids::Vector{Int64}; kwargs...)
         ## ugh distributed GC
         GC.gc()
     end
-    
-    ## futures contain data returned by process!()
-    res = Dict{Int64,Any}()
-    for (k,v) in futures
-        wait(v)
-        res[k] = fetch(v)
-        finalize(v)
+
+    ## data returned by process!() will show up in result_chans
+    res = Dict{Int,Any}()
+    @sync for (k,v) in result_chans
+        errormonitor(@async res[k] = take!(v))
     end
 
     for i in unit_ids
         ## not sure it's actually necesary to "finalize" channels but doesn't seem to hurt
+        remotecall_fetch(finalize, i, result_chans[i])
         remotecall_fetch(finalize, i, in_chans[i])
         remotecall_fetch(finalize, i, out_chans[i])
         remotecall_fetch(finalize, i, report_chans[i])
-        #finalize(in_chans[i])
-        #finalize(out_chans[i])
-        #finalize(report_chans[i])
         remotecall_fetch(GC.gc, i) ## distributed GC is _really_ not very smart
     end
     GC.gc()

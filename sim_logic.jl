@@ -70,7 +70,7 @@ mutable struct SimData <: abstractSimData
     n_agents::Int
     I_set::Set{UInt32} ## current infected
     R_set::Set{UInt32} ## current recovered
-    t_recovery::UnitRange{Int64} ## range of recovery times
+    t_recovery::UnitRange{Int} ## range of recovery times
     report_freq::UInt32
     periodic_stuff_period::UInt32 ## mainly for updating out-of-network infections
 
@@ -86,7 +86,7 @@ mutable struct SimData <: abstractSimData
     cumI_by_geo::Dict{Symbol,Vector{Int}} ## each location is a vector index
     report_by_geo::Dict{Symbol,Vector{Vector{Int}}} ## time series by geo; each location is a vector index
 
-    intervals::Dict{Symbol, UnitRange{Int64}} ## time intervals for special treatment; holidays etc
+    intervals::Dict{Symbol, UnitRange{Int}} ## time intervals for special treatment; holidays etc
     flags::Set{Symbol} ## misc boolean flags, mainly for testing
     ## constructor returns an empty struct; filled using external inputs by init_sim_unit fn below
     SimData() = new()
@@ -189,12 +189,12 @@ end
 
 ## N random contact events; samples with replacement from neigh; N is the first/only value in params
 ##   note, params must be a single-Int tuple (N,) if using this fn 
-function distr_const(neigh::AbstractVector{I}, params::Tuple{Int64})::Vector{UInt32} where I<:Integer
+function distr_const(neigh::AbstractVector{I}, params::Tuple{Int})::Vector{UInt32} where I<:Integer
     return rsamp(neigh, params[1])
 end
 
 ## Poission(L) gives the number of contact events, then sample with replacement; L is the first/only value in params
-function distr_pois(neigh::AbstractVector{I}, params::Tuple{Int64})::Vector{UInt32} where I<:Integer
+function distr_pois(neigh::AbstractVector{I}, params::Tuple{R})::Vector{UInt32} where {I<:Integer,R<:Real}
     n = rand(Poisson(params[1]))
     return rsamp(neigh, n)
 end
@@ -203,7 +203,7 @@ end
 function safe_rgeo(u::R) where R<:Real
     return u > 0 ? rand(Geometric(1/(1+u))) : 0 ## must be > 0
 end
-function distr_exp(neigh::AbstractVector{I}, params::Tuple{Int64})::Vector{UInt32} where I<:Integer
+function distr_exp(neigh::AbstractVector{I}, params::Tuple{R})::Vector{UInt32} where {I<:Integer,R<:Real}
     n = safe_rgeo(params[1])
     return rsamp(neigh, n)
 end
@@ -453,7 +453,7 @@ end
 ## direct events from global queue to a local sim unit based on the criteria in this function
 ## on sync, each sim unit sends a vector of global events; this function is called once for each such vector
 ## returns a dict specifying which sim unit will get which events
-function sort_glob_events(glob_data::globalData, targets::Vector{Int64}, global_events::Vector{simEvent})::Dict{Int64,Vector{simEvent}}
+function sort_glob_events(glob_data::globalData, targets::Vector{Int}, global_events::Vector{simEvent})::Dict{Int,Vector{simEvent}}
     d = Dict(i => simEvent[] for i in targets) ## empty vectors if no events
     for e in global_events
         unit_id = glob_data.idxs[e.agentid]
@@ -470,7 +470,7 @@ calc_mean_hh(netw_mat,exclude) = mean(sum(netw_mat[:,setdiff(axes(netw_mat,2), e
 calc_mean_wp(netw_mat,exclude) = mean(filter(x->x>0, sum(netw_mat[:,setdiff(axes(netw_mat,2), exclude)], dims=1)))
 
 ## assigning agents to sim units; just random for now
-function agent_assignment(unit_ids::Vector{Int64}, nn::Int64)
+function agent_assignment(unit_ids::Vector{Int}, nn::Int)
     n = length(unit_ids)
     ## not really necessary to randomize but doesn't hurt
     splits = ranges(lrRound(fill(nn/n, n)))
@@ -482,7 +482,7 @@ end
 ## all external inputs go into this dict, which the global process then uses to initialize local sim units
 ## (this may seem a little convoluted, but it allows the main process to read in whatever data is needed,
 ##    copy pieces to the local workers, and then delete this object to free up memory)
-function modelInputs(unit_ids::Vector{Int64}; kwargs...)
+function modelInputs(unit_ids::Vector{Int}; kwargs...)
     ## note, calling kwargs like a fn is enabled by a definition in utils.jl
     netw_hh = SparseMatrixCSC{Bool, UInt32}(kwargs(:netw_hh, ()->Symmetric(dser_path("jlse/adj_mat_hh.jlse"))))
     netw_wp = SparseMatrixCSC{Bool, UInt32}(kwargs(:netw_wp, ()->Symmetric(dser_path("jlse/adj_mat_wp.jlse"))))
@@ -669,7 +669,7 @@ function init_sim_unit!(u::SimUnit, inputs::Dict{Symbol,Any})
     d.mean_wp_connections = inputs[:mean_wp_connections]
 
     ## include keys only for specified intervals
-    d.intervals = Dict{Symbol, UnitRange{Int64}}(k=>inputs[k] for k in 
+    d.intervals = Dict{Symbol, UnitRange{Int}}(k=>inputs[k] for k in 
         [:nonessential_wp_closed, :sch_closed] if !ismissing(inputs[k]))
     
     d.flags = inputs[:flags]
