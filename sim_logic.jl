@@ -725,6 +725,8 @@ function precalc_sets()
 
     p_idxs = let k = dser_path("jlse/adj_mat_keys.jlse"); Dict(k .=> UInt32.(eachindex(k))); end
 
+    mkpath("precalc")
+    
     ## for looking up a person's location index
     ser_path("precalc/cbg_idx_lookup.jlse", Dict(i=>k[3] for (k,i) in p_idxs))
 

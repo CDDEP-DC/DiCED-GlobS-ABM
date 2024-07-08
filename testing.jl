@@ -1,5 +1,10 @@
 
 
+
+using Distributed
+addprocs(3; lazy=false)
+
+
 include("gabm.jl")
 include("sim_logic.jl")
 
@@ -25,13 +30,20 @@ end
 #mu_work_cnx = mean(filter(x->x>0, sum(adj_mat[:,setdiff(axes(adj_mat,2), outw_idxs)], dims=1)))
 #netw = adj_mat .| hh_adj_mat;
 
-
-t = 602
+t = 30
+#t = 602
 I0 = [2=>100,3=>100,4=>100]
 pI = 0.1
 t_closed = 50:400
 
 mkpath("test")
+
+x = test(t; init_inf=I0, p_inf=pI, p_inf_hh=2.0*pI, p_inf_loc=pI,
+distr_fn_hh=:all, distr_fn_non_hh=:all, distr_params_hh=(), distr_params_non_hh=(), 
+distr_fn_loc_res=:exp, distr_params_loc_res=(4,), distr_fn_loc_work=:exp, distr_params_loc_work=(2,) 
+); GC.gc();
+
+
 
 for i in 20:0
     serialize("test/sim_MD_p0"*string(round(Int,pI*100))*"_open"*string(i)*".jlse", 
@@ -125,6 +137,7 @@ g_wp_sch_p = [g_wp_sch_t[r] ./ pops_all for r in eachindex(g_wp_sch_t)]
 
 total_p_open = [sum(g_open_t[r]) / sum(pops_all) for r in eachindex(g_open_t)]
 total_p_wp_sch = [sum(g_wp_sch_t[r]) / sum(pops_all) for r in eachindex(g_wp_sch_t)]
+
 
 
 ## baltimore
@@ -298,6 +311,13 @@ nn = 9424031 #9440777 ## MD
 nlocs = 2141
 
 
+pI = 0.15
+r_inc = 5
+ids = 2:4
+xlim = floor(Int, 550/r_inc)
+xs = collect(1:xlim) .* r_inc;
+
+
 
 for i in 1:10
     serialize("test/sim_MD_p0"*string(round(Int,pI*100))*"_base"*string(i)*".jlse", 
@@ -368,11 +388,6 @@ end
 
 
 
-pI = 0.15
-r_inc = 5
-ids = 2:4
-xlim = floor(Int, 550/r_inc)
-xs = collect(1:xlim) .* r_inc;
 
 
 
